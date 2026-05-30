@@ -9,18 +9,30 @@ sample whose obfuscator inserts opaque table-based constant expressions of the f
 
 ## Layout
 
+Everything is packaged into a single archive — keeps the repo tree light and gives users
+one file to download.
+
 ```
 comparison/
-├── jadx-output/    # 73 .java files — jadx (this fork) WITH the plugin enabled
-├── jeb-output/     # 73 .java files — JEB on the same dex, with no deobfuscation
-└── dex/
-    ├── classes.dex                # the primary dex (4.0 MB; the input to both tools)
-    ├── lncoecijgsyzlsoz.dex       # secondary dex (428 KB) — runtime-loaded
-    └── SHA256SUMS
+├── README.md         (this file)
+└── comparison.zip    (2.0 MB; 5.4 MB uncompressed, 148 files)
+    ├── jadx-output/  # 73 .java files — jadx (this fork) WITH the plugin enabled
+    ├── jeb-output/   # 73 .java files — JEB on the same dex, with no deobfuscation
+    └── dex/
+        ├── classes.dex             # the primary dex (4.0 MB; the input to both tools)
+        ├── lncoecijgsyzlsoz.dex    # secondary dex (428 KB) — runtime-loaded
+        └── SHA256SUMS
 ```
 
 Same 73-file slice from each tool (the `com.mistral.jon` package, before the obfuscator's
 own `z.*` classes). The slice is what makes the metrics meaningfully paired.
+
+To unpack:
+
+```bash
+unzip comparison.zip                 # extracts ./jadx-output, ./jeb-output, ./dex
+sha256sum -c dex/SHA256SUMS          # integrity check on the dex files
+```
 
 ## Aggregate numbers (recap)
 
