@@ -87,6 +87,10 @@ public void onReceive(Context context0, Intent intent0) {
 The 5 failures are on the same pathologically obfuscated service methods in both tools — a
 property of the obfuscator, not of either decompiler.
 
+The full side-by-side outputs and the source `classes.dex` used to produce these numbers
+are in [`comparison/`](comparison/) — see [`comparison/README.md`](comparison/README.md) to
+reproduce.
+
 JEB is a paid commercial tool; the comparison is "stock JEB" vs "free jadx + this plugin". The
 plugin is doing all the heavy lifting on the jadx side — vanilla jadx without it would land much
 closer to JEB on the same APK.
