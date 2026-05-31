@@ -8,7 +8,7 @@ plugins {
 
 // Independent plugin version — keep in sync with StringDecryptPlugin.VERSION (see AGENT.md).
 group = "io.github.arsylk"
-version = "1.2.1"
+version = "1.2.2"
 description = "jadx plugin: compile-time constant deobfuscator + resolvable block-cipher string decryption"
 
 repositories {
@@ -36,6 +36,9 @@ val generateBuildInfo by tasks.registering {
 	val outDir = buildInfoDir
 	outputs.dir(outDir)
 	inputs.property("version", project.version)
+	// Always re-run so BUILD_TIME truly reflects when the jar was built (otherwise gradle would
+	// up-to-date-check on inputs alone and keep the previous timestamp across source-only edits).
+	outputs.upToDateWhen { false }
 	doLast {
 		val pkgDir = outDir.get().asFile.resolve("jadx/plugins/stringdecrypt")
 		pkgDir.mkdirs()

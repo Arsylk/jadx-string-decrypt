@@ -209,7 +209,12 @@ final class PureFold {
 					long[] table = keys.arrays().get(id);
 					Object v = table != null ? new ArrVal(table, f.getType().getArrayElement()) : keys.scalars().get(id);
 					if (v == null) {
-						return null;
+						// Not in the reconstructed app constants → try a JDK static-final lookup
+						// (e.g. StandardCharsets.UTF_8, Long.TYPE, ...) gated to the whitelist.
+						v = boxIncoming(jdk.resolveStaticFinal(f.getDeclClass().getFullName(), f.getName()));
+						if (v == null) {
+							return null;
+						}
 					}
 					put(reg, op, v);
 					break;

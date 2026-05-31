@@ -40,6 +40,7 @@ public final class JdkInterpreter {
 		register(new MathHandler());
 		register(new ArraysHandler());
 		register(new CharsetHandler());
+		register(new StandardCharsetsHandler()); // no methods, just enables SGET on UTF_8 / ISO_8859_1 / ...
 		register(new ObjectHandler()); // virtual dispatch for toString/equals/hashCode/getClass
 		// Reflection chain (Class/Method/Constructor/Field/AccessibleObject) — folds reflective
 		// bridges back to direct calls when every link resolves to a JDK whitelist member.
@@ -79,5 +80,32 @@ public final class JdkInterpreter {
 	/** Does any registered handler claim this declaring class? */
 	public boolean handles(String declClass) {
 		return handlers.containsKey(declClass);
+	}
+
+	/**
+	 * Resolve {@code declClass#fieldName} as a static-final JDK constant, gated on the declaring
+	 * class being in the whitelist. Used by both {@code ObjectEvaluator} (for SGET inside the
+	 * caller's IR) and {@code PureFold} (for SGET inside a snapshotted helper body). Returns the
+	 * actual constant value (e.g. {@code int.class} for {@code Integer.TYPE},
+	 * {@code Charset} instance for {@code StandardCharsets.UTF_8}) or {@code null} if the class
+	 * isn't whitelisted, the field isn't static-final, or reflection failed.
+	 */
+	@Nullable
+	public Object resolveStaticFinal(String declClass, String fieldName) {
+		if (!handles(declClass)) {
+			return null;
+		}
+		try {
+			Class<?> cls = Class.forName(declClass, false, ClassLoader.getSystemClassLoader());
+			java.lang.reflect.Field f = cls.getField(fieldName);
+			int mods = f.getModifiers();
+			if (!java.lang.reflect.Modifier.isStatic(mods) || !java.lang.reflect.Modifier.isFinal(mods)) {
+				return null;
+			}
+			f.setAccessible(true);
+			return f.get(null);
+		} catch (Throwable t) {
+			return null;
+		}
 	}
 }

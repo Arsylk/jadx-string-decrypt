@@ -39,104 +39,90 @@ public class StringDecryptOptions extends BasePluginOptionsBuilder {
 	@Override
 	public void registerOptions() {
 		boolOption(StringDecryptPlugin.PLUGIN_ID + ".enabled")
-				.description("Master switch for the deobfuscator")
+				.description("Enable")
 				.defaultValue(true)
 				.setter(v -> enabled = v);
 
 		boolOption(StringDecryptPlugin.PLUGIN_ID + ".fold-consts")
-				.description("Replace compile-time-constant numeric/boolean expressions (e.g. the opaque"
-						+ " table-based `((int) KEY[k]) ^ c`) with their literal value everywhere")
+				.description("Fold constants")
 				.defaultValue(true)
 				.setter(v -> foldConsts = v);
 
 		boolOption(StringDecryptPlugin.PLUGIN_ID + ".fold-helper-calls")
-				.description("Also fold calls to pure, fully-interpretable helper methods with constant"
-						+ " args (interprocedural constant folding)")
+				.description("Fold pure helper calls")
 				.defaultValue(true)
 				.setter(v -> foldHelperCalls = v);
 
 		boolOption(StringDecryptPlugin.PLUGIN_ID + ".decrypt-strings")
-				.description("Decrypt resolvable block-cipher string-decryptor calls (auto-detected) whose"
-						+ " byte[] argument is a compile-time constant")
+				.description("Decrypt string calls")
 				.defaultValue(true)
 				.setter(v -> decryptStrings = v);
 
 		boolOption(StringDecryptPlugin.PLUGIN_ID + ".cleanup")
-				.description("Remove instructions left dead after folding/decryption (table reads, the"
-						+ " consumed byte-array build, folded-away arithmetic)")
+				.description("Clean up dead instructions")
 				.defaultValue(true)
 				.setter(v -> cleanup = v);
 
 		boolOption(StringDecryptPlugin.PLUGIN_ID + ".cleanup-orphan-arrays")
-				.description("Also sweep orphan `new byte[]{...}[N] = X;` expression statements that are"
-						+ " written-only after folding consumed their contents. Subsumed by cleanup.")
+				.description("Clean up orphan byte[] statements")
 				.defaultValue(true)
 				.setter(v -> cleanupOrphanArrays = v);
 
 		boolOption(StringDecryptPlugin.PLUGIN_ID + ".fold-reflective-bridges")
-				.description("Fold reflective chains (Class.forName(s).getMethod(...).invoke(...),"
-						+ " Constructor.newInstance, Field.get) back to direct values when every link"
-						+ " resolves to a JDK-whitelisted method. Turn off to keep all reflection in source.")
+				.description("Fold reflective chains")
 				.defaultValue(true)
 				.setter(v -> foldReflectiveBridges = v);
 
 		boolOption(StringDecryptPlugin.PLUGIN_ID + ".fold-object-invokes")
-				.description("Also attempt to fold Object/CharSequence-returning invokes (lets us recover"
-						+ " a String value from a reflective Method.invoke even when the IR drops the"
-						+ " (String) cast). Off = only fold INVOKEs whose declared return is String.")
+				.description("Fold Object-returning invokes")
 				.defaultValue(true)
 				.setter(v -> foldObjectReturningInvokes = v);
 
 		boolOption(StringDecryptPlugin.PLUGIN_ID + ".suppress-decoy-lookups")
-				.description("When the folded String flows into Class.forName / getMethod / getField /"
-						+ " getConstructor, refuse to emit a non-printable literal (the obfuscator's"
-						+ " decoy chains compute to garbage that would never resolve). Off = always fold.")
+				.description("Skip non-printable reflective name folds")
 				.defaultValue(true)
 				.setter(v -> suppressDecoyLookups = v);
 
 		boolOption(StringDecryptPlugin.PLUGIN_ID + ".comments")
-				.description("Add a method comment listing the strings decrypted in it")
+				.description("Add decrypted-strings comment")
 				.defaultValue(true)
 				.setter(v -> comments = v);
 
 		strOption(StringDecryptPlugin.PLUGIN_ID + ".decryptor-class")
-				.description("Restrict the string decryptor to this raw class name; empty = rely on"
-						+ " auto-detection only (any static String(byte[]) calling Cipher.doFinal)")
+				.description("Decryptor class (empty = auto)")
 				.defaultValue("")
 				.setter(v -> decryptorClass = v);
 
 		strOption(StringDecryptPlugin.PLUGIN_ID + ".decryptor-desc")
-				.description("Method descriptor used to recognise a string decryptor (args + return)")
+				.description("Decryptor descriptor")
 				.defaultValue(DEFAULT_DECRYPTOR_DESC)
 				.setter(v -> decryptorDesc = v);
 
 		strOption(StringDecryptPlugin.PLUGIN_ID + ".cipher")
-				.description("JCE transformation used to decrypt strings (the key is the trailing"
-						+ " key-tail-len bytes of each blob, the rest is the ciphertext)")
+				.description("Cipher transformation")
 				.defaultValue(DEFAULT_CIPHER)
 				.setter(v -> cipher = v);
 
 		intOption(StringDecryptPlugin.PLUGIN_ID + ".key-tail-len")
-				.description("Number of key bytes appended at the end of each ciphertext blob")
+				.description("Appended key length")
 				.defaultValue(DEFAULT_KEY_TAIL_LEN)
 				.setter(v -> keyTailLen = v);
 
 		intOption(StringDecryptPlugin.PLUGIN_ID + ".max-table-size")
-				.description("Maximum reconstructed static-array length (guards against hostile/huge sizes)")
+				.description("Max array length")
 				.defaultValue(DEFAULT_MAX_TABLE_SIZE)
 				.setter(v -> maxTableSize = v);
 
-		// Read-only "About" entries — show provenance in the GUI settings panel so you can tell
-		// exactly which build is loaded without leaving jadx. NOT_CHANGING_CODE keeps the code
-		// cache from invalidating when these display values change between rebuilds.
+		// Read-only "About" entries — provenance for the loaded jar; NOT_CHANGING_CODE keeps the
+		// code cache from invalidating when these display values change between rebuilds.
 		strOption(StringDecryptPlugin.PLUGIN_ID + ".version")
-				.description("Plugin version (read-only)")
+				.description("Version")
 				.defaultValue(BuildInfo.VERSION)
 				.flags(OptionFlag.DISABLE_IN_GUI, OptionFlag.NOT_CHANGING_CODE)
 				.setter(v -> { /* read-only display */ });
 
 		strOption(StringDecryptPlugin.PLUGIN_ID + ".build-time")
-				.description("UTC timestamp when this plugin jar was built (read-only)")
+				.description("Built")
 				.defaultValue(BuildInfo.BUILD_TIME)
 				.flags(OptionFlag.DISABLE_IN_GUI, OptionFlag.NOT_CHANGING_CODE)
 				.setter(v -> { /* read-only display */ });

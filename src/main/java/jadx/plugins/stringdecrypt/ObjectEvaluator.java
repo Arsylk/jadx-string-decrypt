@@ -255,22 +255,9 @@ final class ObjectEvaluator {
 			return null;
 		}
 		jadx.core.dex.info.FieldInfo f = (jadx.core.dex.info.FieldInfo) idx;
-		String declClass = f.getDeclClass().getFullName();
-		if (!jdk.handles(declClass)) {
-			return null; // unhandled class — e.g. java.lang.System (we never want to load .out/.err)
-		}
-		try {
-			Class<?> cls = Class.forName(declClass, false, ClassLoader.getSystemClassLoader());
-			java.lang.reflect.Field jf = cls.getField(f.getName());
-			int mods = jf.getModifiers();
-			if (!java.lang.reflect.Modifier.isStatic(mods) || !java.lang.reflect.Modifier.isFinal(mods)) {
-				return null; // only static-final fields are compile-time-constant
-			}
-			jf.setAccessible(true);
-			return jf.get(null);
-		} catch (Throwable t) {
-			return null;
-		}
+		// Delegate to JdkInterpreter so the same allow-list governs SGET resolution everywhere
+		// (here in caller-IR walks, and inside PureFold's interpreter for snapshotted helpers).
+		return jdk.resolveStaticFinal(f.getDeclClass().getFullName(), f.getName());
 	}
 
 	/** Inline-array fallback: resolve integral arrays directly from the FILLED_NEW_ARRAY node. */
