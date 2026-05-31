@@ -44,6 +44,7 @@ final class Evaluator {
 	private final KeyData keys;
 	private final PureFold pureFold;
 	private final IdentityHashMap<SSAVar, long[]> localArrays = new IdentityHashMap<>();
+	private final Set<FilledNewArrayNode> filledInProgress = Collections.newSetFromMap(new IdentityHashMap<>());
 	private final Set<InsnNode> activePhi = Collections.newSetFromMap(new IdentityHashMap<>());
 	private final IdentityHashMap<InsnNode, Long> evalCache = new IdentityHashMap<>(); // memoize evalInt
 
@@ -56,6 +57,16 @@ final class Evaluator {
 	// ------------------------------------------------------------------------------------------
 	// constant byte[] resolution (the decrypt argument)
 	// ------------------------------------------------------------------------------------------
+
+	/**
+	 * Resolve any integral array reference to its constant {@code long[]} contents (widened/extended
+	 * per element type). Convenience wrapper for non-{@code byte[]} callers — used by
+	 * {@link ObjectEvaluator} to reconstruct {@code char[]}/{@code int[]}/etc.
+	 */
+	@Nullable
+	long[] resolveLongArray(InsnArg arg) {
+		return resolveArrayBase(arg, 0);
+	}
 
 	@Nullable
 	byte[] resolveByteArray(InsnArg arg) {
@@ -143,6 +154,10 @@ final class Evaluator {
 			}
 		}
 		return null;
+	}
+
+	private static java.util.List<LiteralArg> asLiteralArgs(FillArrayInsn fill, ArgType elem) {
+		return fill.getLiteralArgs(elem);
 	}
 
 	private static byte[] fillToBytes(FillArrayInsn fill) {
@@ -364,6 +379,18 @@ final class Evaluator {
 			return null;
 		}
 		long[] table = new long[size];
+		// 1) Seed from any associated FILL_ARRAY payload (e.g. dx-style "new byte[N]; fill-array-data").
+		//    Without this, the initial table is all-zeros and reads of pre-APUT positions wrongly return 0.
+		FillArrayInsn fill = findFill(sVar);
+		if (fill != null) {
+			List<LiteralArg> lits = fill.getLiteralArgs(elem);
+			for (int i = 0; i < lits.size() && i < size; i++) {
+				table[i] = Eval.extend(elem, lits.get(i).getLiteral());
+			}
+		}
+		// 2) Apply APUTs in program order (last write wins). Critically, this means a downstream AGET
+		//    that reads a mutated index sees the POST-APUT value — required for the obfuscator pattern
+		//    `byte[] arr = {…}; arr[k] = X; … BigInteger.valueOf(arr[k] + N)` to fold correctly.
 		for (BlockNode block : mth.getBasicBlocks()) {
 			for (InsnNode insn : block.getInstructions()) {
 				if (insn.getType() == InsnType.APUT && insn.getArg(0).isSameVar(arrArg)) {
@@ -397,6 +424,37 @@ final class Evaluator {
 				return null;
 			}
 			table[i] = Eval.extend(elem, v);
+		}
+		// Apply any APUTs targeting this FILLED_NEW_ARRAY's result reg: the obfuscator pattern
+		// `byte[] arr = {...}; arr[k] = X; … arr[k]` would otherwise see arr[k]'s un-patched
+		// literal at a downstream AGET. Cycle break: a Set membership check on the FA itself
+		// avoids infinite recursion if an APUT value resolves through this same array.
+		RegisterArg result = fa.getResult();
+		if (result == null || result.getSVar() == null) {
+			return table;
+		}
+		if (!filledInProgress.add(fa)) {
+			return table; // re-entered: just expose the inline-literal view to the inner caller
+		}
+		try {
+			for (BlockNode block : mth.getBasicBlocks()) {
+				for (InsnNode insn : block.getInstructions()) {
+					if (insn.getType() == InsnType.APUT && insn.getArg(0).isSameVar(result)) {
+						Long idx = evalInt(insn.getArg(1), 0);
+						Long val = evalInt(insn.getArg(2), 0);
+						if (idx == null || val == null) {
+							continue; // skip APUT we can't resolve; keep the inline value at that slot
+						}
+						int i = idx.intValue();
+						if (i < 0 || i >= table.length) {
+							continue;
+						}
+						table[i] = Eval.extend(elem, val);
+					}
+				}
+			}
+		} finally {
+			filledInProgress.remove(fa);
 		}
 		return table;
 	}

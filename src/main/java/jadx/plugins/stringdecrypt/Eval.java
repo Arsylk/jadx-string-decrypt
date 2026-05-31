@@ -17,6 +17,8 @@ import jadx.core.dex.info.MethodInfo;
 import jadx.core.dex.instructions.ArithNode;
 import jadx.core.dex.instructions.FillArrayData;
 import jadx.core.dex.instructions.FillArrayInsn;
+import jadx.core.dex.instructions.GotoNode;
+import jadx.core.dex.instructions.IfNode;
 import jadx.core.dex.instructions.IndexInsnNode;
 import jadx.core.dex.instructions.InsnType;
 import jadx.core.dex.instructions.InvokeNode;
@@ -270,17 +272,32 @@ final class Eval {
 		if (insns == null) {
 			return null;
 		}
-		List<MethodBody.Op> ops = new ArrayList<>();
-		for (InsnNode insn : insns) {
-			if (insn == null) {
+		// Pass 1: build a dex-offset -> op-array-index map. The raw insn array is offset-indexed (so
+		// IF/GOTO targets are array indices in `insns`); we need to translate those to compact op-array
+		// indices since the snapshot skips null/NOP slots.
+		Map<Integer, Integer> offsetToOpIndex = new HashMap<>();
+		int opCount = 0;
+		for (int i = 0; i < insns.length; i++) {
+			if (insns[i] == null || insns[i].getType() == InsnType.NOP || insns[i].getType() == InsnType.FILL_ARRAY_DATA) {
 				continue;
 			}
-			if (ops.size() >= SNAPSHOT_MAX_INSNS) {
+			offsetToOpIndex.put(i, opCount);
+			opCount++;
+			if (opCount > SNAPSHOT_MAX_INSNS) {
 				return null;
 			}
-			MethodBody.Op op = snapshotOp(insn);
+		}
+		// Pass 2: emit the ops, resolving branch targets through the map. Any unresolvable target
+		// (off-end or pointing at a NOP we filtered) refuses the snapshot.
+		List<MethodBody.Op> ops = new ArrayList<>(opCount);
+		for (int i = 0; i < insns.length; i++) {
+			InsnNode insn = insns[i];
+			if (insn == null || insn.getType() == InsnType.NOP || insn.getType() == InsnType.FILL_ARRAY_DATA) {
+				continue;
+			}
+			MethodBody.Op op = snapshotOp(insn, offsetToOpIndex);
 			if (op == null) {
-				return null; // unsupported opcode -> refuse to snapshot (so it is never folded)
+				return null;
 			}
 			ops.add(op);
 		}
@@ -295,7 +312,7 @@ final class Eval {
 		return new MethodBody(ops.toArray(new MethodBody.Op[0]), regs);
 	}
 
-	private static @Nullable MethodBody.Op snapshotOp(InsnNode insn) {
+	private static @Nullable MethodBody.Op snapshotOp(InsnNode insn, Map<Integer, Integer> offsetToOpIndex) {
 		MethodBody.Arg[] args = new MethodBody.Arg[insn.getArgsCount()];
 		for (int i = 0; i < args.length; i++) {
 			InsnArg a = insn.getArg(i);
@@ -311,6 +328,7 @@ final class Eval {
 		switch (insn.getType()) {
 			case RETURN:
 			case CONST:
+			case CONST_STR:
 			case MOVE:
 			case NEG:
 			case NOT:
@@ -318,25 +336,46 @@ final class Eval {
 			case APUT:
 			case NEW_INSTANCE:
 			case MOVE_RESULT:
-				return new MethodBody.Op(insn.getType(), resultReg, args, null, null, null, null);
+			case ARRAY_LENGTH:
+				return new MethodBody.Op(insn.getType(), resultReg, args, null, null, null, null, null, -1);
 			case CAST: {
 				Object idx = insn instanceof IndexInsnNode ? ((IndexInsnNode) insn).getIndex() : null;
 				return new MethodBody.Op(InsnType.CAST, resultReg, args,
-						idx instanceof ArgType ? (ArgType) idx : null, null, null, null);
+						idx instanceof ArgType ? (ArgType) idx : null, null, null, null, null, -1);
 			}
 			case ARITH:
-				return new MethodBody.Op(InsnType.ARITH, resultReg, args, null, ((ArithNode) insn).getOp(), null, null);
+				return new MethodBody.Op(InsnType.ARITH, resultReg, args, null, ((ArithNode) insn).getOp(), null, null, null, -1);
 			case NEW_ARRAY:
 				return new MethodBody.Op(InsnType.NEW_ARRAY, resultReg, args,
-						((NewArrayNode) insn).getArrayType().getArrayElement(), null, null, null);
+						((NewArrayNode) insn).getArrayType().getArrayElement(), null, null, null, null, -1);
 			case SGET: {
 				FieldInfo f = fieldOf(insn);
-				return f == null ? null : new MethodBody.Op(InsnType.SGET, resultReg, args, null, null, f, null);
+				return f == null ? null
+						: new MethodBody.Op(InsnType.SGET, resultReg, args, null, null, f, null, null, -1);
 			}
 			case INVOKE:
-				return new MethodBody.Op(InsnType.INVOKE, resultReg, args, null, null, null, ((InvokeNode) insn).getCallMth());
+				return new MethodBody.Op(InsnType.INVOKE, resultReg, args, null, null, null,
+						((InvokeNode) insn).getCallMth(), null, -1);
+			case IF: {
+				IfNode ifn = (IfNode) insn;
+				Integer target = offsetToOpIndex.get(ifn.getTarget());
+				return target == null ? null
+						: new MethodBody.Op(InsnType.IF, resultReg, args, null, null, null, null, ifn.getOp(), target);
+			}
+			case GOTO: {
+				GotoNode gn = (GotoNode) insn;
+				Integer target = offsetToOpIndex.get(gn.getTarget());
+				return target == null ? null
+						: new MethodBody.Op(InsnType.GOTO, -1, args, null, null, null, null, null, target);
+			}
+			case CONSTRUCTOR:
+				// Currently the prepare-pass raw insns are still pre-ConstructorVisitor (the merge of
+				// NEW_INSTANCE + invoke-direct <init>); we only see the explicit INVOKE form here. If we
+				// ever start running against post-normalized IR, this case prevents a silent refusal.
+				return new MethodBody.Op(InsnType.INVOKE, resultReg, args, null, null, null,
+						((InvokeNode) insn).getCallMth(), null, -1);
 			default:
-				return null; // control flow or any unsupported instruction
+				return null; // any unsupported instruction -> refuse
 		}
 	}
 

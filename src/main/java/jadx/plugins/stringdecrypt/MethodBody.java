@@ -5,6 +5,7 @@ import org.jetbrains.annotations.Nullable;
 import jadx.core.dex.info.FieldInfo;
 import jadx.core.dex.info.MethodInfo;
 import jadx.core.dex.instructions.ArithOp;
+import jadx.core.dex.instructions.IfOp;
 import jadx.core.dex.instructions.InsnType;
 import jadx.core.dex.instructions.args.ArgType;
 
@@ -15,8 +16,10 @@ import jadx.core.dex.instructions.args.ArgType;
  * thread may be decompiling concurrently.
  *
  * <p>
- * Only the small whitelist of side-effect-free opcodes the interpreter understands is captured; a
- * method containing anything else is not snapshotted at all (so it is simply never folded).
+ * Supports a small instruction-pointer-driven control flow model — IF/GOTO with pre-resolved
+ * branch targets ({@link Op#branchTarget} is an op-array index, never a raw dex offset) — so for-
+ * and while-loops in pure helpers can be interpreted directly. A method containing any instruction
+ * outside the interpreter's whitelist is not snapshotted at all (so it is simply never folded).
  */
 final class MethodBody {
 
@@ -50,9 +53,12 @@ final class MethodBody {
 		final @Nullable ArithOp arithOp; // ARITH operator
 		final @Nullable FieldInfo field; // SGET field
 		final @Nullable MethodInfo callMth; // INVOKE target
+		final @Nullable IfOp ifOp; // IF comparator
+		final int branchTarget; // op-array index (resolved from dex offset); -1 if not a branch
 
 		Op(InsnType type, int resultReg, Arg[] args, @Nullable ArgType argType,
-				@Nullable ArithOp arithOp, @Nullable FieldInfo field, @Nullable MethodInfo callMth) {
+				@Nullable ArithOp arithOp, @Nullable FieldInfo field, @Nullable MethodInfo callMth,
+				@Nullable IfOp ifOp, int branchTarget) {
 			this.type = type;
 			this.resultReg = resultReg;
 			this.args = args;
@@ -60,6 +66,8 @@ final class MethodBody {
 			this.arithOp = arithOp;
 			this.field = field;
 			this.callMth = callMth;
+			this.ifOp = ifOp;
+			this.branchTarget = branchTarget;
 		}
 	}
 

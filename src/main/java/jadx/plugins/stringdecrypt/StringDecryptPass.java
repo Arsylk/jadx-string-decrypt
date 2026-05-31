@@ -11,7 +11,10 @@ import jadx.api.plugins.pass.JadxPassInfo;
 import jadx.api.plugins.pass.impl.OrderedJadxPassInfo;
 import jadx.api.plugins.pass.types.JadxDecompilePass;
 import jadx.core.dex.attributes.AType;
+import jadx.core.dex.info.MethodInfo;
+import jadx.core.dex.instructions.BaseInvokeNode;
 import jadx.core.dex.instructions.ConstStringNode;
+import jadx.core.dex.instructions.IndexInsnNode;
 import jadx.core.dex.instructions.InsnType;
 import jadx.core.dex.instructions.InvokeNode;
 import jadx.core.dex.instructions.args.ArgType;
@@ -19,6 +22,7 @@ import jadx.core.dex.instructions.args.InsnArg;
 import jadx.core.dex.instructions.args.InsnWrapArg;
 import jadx.core.dex.instructions.args.RegisterArg;
 import jadx.core.dex.instructions.args.SSAVar;
+import jadx.core.dex.instructions.mods.ConstructorInsn;
 import jadx.core.dex.nodes.BlockNode;
 import jadx.core.dex.nodes.ClassNode;
 import jadx.core.dex.nodes.InsnNode;
@@ -26,6 +30,7 @@ import jadx.core.dex.nodes.MethodNode;
 import jadx.core.dex.nodes.RootNode;
 import jadx.core.utils.BlockUtils;
 import jadx.core.utils.InsnRemover;
+import jadx.plugins.stringdecrypt.jdk.JdkInterpreter;
 
 /**
  * Finds resolvable decrypt calls (top-level or wrapped into another instruction's argument),
@@ -39,11 +44,24 @@ public class StringDecryptPass implements JadxDecompilePass {
 	private final StringDecryptOptions options;
 	private final KeyData keys;
 	private final PureFold pureFold;
+	private final JdkInterpreter jdk;
 
 	public StringDecryptPass(StringDecryptOptions options, KeyData keys) {
 		this.options = options;
 		this.keys = keys;
-		this.pureFold = new PureFold(keys);
+		this.jdk = new JdkInterpreter();
+		// Reflective-bridge fold is gated by an option: drop the reflection handlers entirely when
+		// disabled, so reflective Method.invoke / Constructor.newInstance / Field.get / Class.forName
+		// chains stay verbatim in source (useful when you want to study the obfuscator's reflection
+		// layer rather than see through it).
+		if (!options.isFoldReflectiveBridges()) {
+			jdk.unregister("java.lang.Class");
+			jdk.unregister("java.lang.reflect.Method");
+			jdk.unregister("java.lang.reflect.Constructor");
+			jdk.unregister("java.lang.reflect.Field");
+			jdk.unregister("java.lang.reflect.AccessibleObject");
+		}
+		this.pureFold = new PureFold(keys, jdk);
 	}
 
 	@Override
@@ -69,14 +87,16 @@ public class StringDecryptPass implements JadxDecompilePass {
 			return;
 		}
 		Evaluator ev = new Evaluator(mth, keys);
+		ObjectEvaluator oev = new ObjectEvaluator(mth, keys, ev, pureFold, jdk);
+		FOLD_OBJ_INVOKES.set(options.isFoldObjectReturningInvokes());
 		List<String> decrypted = new ArrayList<>();
 		List<RegisterArg> builtArrays = new ArrayList<>();
 		for (BlockNode block : mth.getBasicBlocks()) {
 			for (InsnNode insn : block.getInstructions()) {
-				replaceWrapped(mth, ev, insn, decrypted, builtArrays);
+				replaceWrapped(mth, ev, oev, insn, decrypted, builtArrays);
 			}
 			for (InsnNode insn : new ArrayList<>(block.getInstructions())) {
-				ConstStringNode repl = tryReplace(mth, ev, insn, decrypted, builtArrays);
+				ConstStringNode repl = tryReplace(mth, ev, oev, insn, decrypted, builtArrays, false);
 				if (repl != null) {
 					BlockUtils.replaceInsn(mth, block, insn, repl);
 				}
@@ -88,11 +108,14 @@ public class StringDecryptPass implements JadxDecompilePass {
 				cleanupArrayBuild(mth, arrArg);
 			}
 			removeDeadPureInsns(mth); // drop now-unused table reads / folded-away arithmetic
+			if (options.isCleanupOrphanArrays()) {
+				removeDeadArrayBuilds(mth); // sweep orphan `new byte[]{...}[N] = X` statements after folds
+			}
 		}
 		if (!decrypted.isEmpty()) {
 			LOG.info("string-decrypt: {} string(s) in {}", decrypted.size(), mth);
 			if (options.isComments()) {
-				mth.addInfoComment("String decrypt: " + String.join("; ", decrypted));
+				mth.addInfoComment("String decrypt: " + summarizeDecrypted(decrypted));
 			}
 		}
 		if (folded > 0) {
@@ -228,6 +251,84 @@ public class StringDecryptPass implements JadxDecompilePass {
 		}
 	}
 
+	/**
+	 * Generic post-fold sweep: any {@code new-array} / {@code filled-new-array} whose result is only
+	 * written to (via {@code aput}/{@code fill-array}) and never read becomes orphaned after the
+	 * folds consume the byte[] values. Remove the build along with its feeder writes, iterated to a
+	 * fixpoint. Complements {@link #cleanupArrayBuild}, which only sweeps arrays explicitly tracked
+	 * by the decrypt path.
+	 */
+	private static void removeDeadArrayBuilds(MethodNode mth) {
+		boolean removedAny = true;
+		while (removedAny) {
+			removedAny = false;
+			List<InsnNode> dead = new ArrayList<>();
+			for (BlockNode block : mth.getBasicBlocks()) {
+				for (InsnNode insn : block.getInstructions()) {
+					InsnType t = insn.getType();
+					if (t != InsnType.NEW_ARRAY && t != InsnType.FILLED_NEW_ARRAY) {
+						continue;
+					}
+					RegisterArg result = insn.getResult();
+					SSAVar sVar = result != null ? result.getSVar() : null;
+					if (sVar == null) {
+						continue;
+					}
+					List<InsnNode> feeders = new ArrayList<>();
+					boolean hasReader = false;
+					for (RegisterArg use : sVar.getUseList()) {
+						InsnNode p = use.getParentInsn();
+						if (p == null) {
+							continue;
+						}
+						if (p.getType() == InsnType.APUT || p.getType() == InsnType.FILL_ARRAY) {
+							feeders.add(p);
+						} else {
+							hasReader = true;
+							break;
+						}
+					}
+					if (!hasReader) {
+						dead.addAll(feeders);
+						dead.add(insn);
+					}
+				}
+			}
+			if (!dead.isEmpty()) {
+				InsnRemover.removeAllAndUnbind(mth, dead);
+				removedAny = true;
+			}
+		}
+	}
+
+	/**
+	 * Cap the "String decrypt: …" comment at a few unique entries so heavily-obfuscated methods
+	 * (hundreds of folded strings) don't produce wall-of-text comments that drown out the actual
+	 * code. The full list lives in the debug log; the comment is for quick orientation.
+	 */
+	private static String summarizeDecrypted(List<String> decrypted) {
+		final int MAX_ENTRIES = 12;
+		final int MAX_LEN = 600;
+		List<String> uniq = new ArrayList<>();
+		for (String e : decrypted) {
+			if (!uniq.contains(e)) {
+				uniq.add(e);
+				if (uniq.size() >= MAX_ENTRIES) {
+					break;
+				}
+			}
+		}
+		String joined = String.join("; ", uniq);
+		if (joined.length() > MAX_LEN) {
+			joined = joined.substring(0, MAX_LEN) + "…";
+		}
+		int extra = decrypted.size() - uniq.size();
+		if (extra > 0) {
+			joined += " (+" + extra + " more)";
+		}
+		return joined;
+	}
+
 	/** Side-effect-free reads/arithmetic that are safe to drop once their result is unused. */
 	private static boolean isDeadCandidate(InsnType type) {
 		switch (type) {
@@ -243,14 +344,15 @@ public class StringDecryptPass implements JadxDecompilePass {
 		}
 	}
 
-	private void replaceWrapped(MethodNode mth, Evaluator ev, InsnNode insn,
+	private void replaceWrapped(MethodNode mth, Evaluator ev, ObjectEvaluator oev, InsnNode insn,
 			List<String> decrypted, List<RegisterArg> builtArrays) {
+		boolean outerIsLookup = isReflectiveNameLookupInvoke(insn);
 		for (int i = 0; i < insn.getArgsCount(); i++) {
 			InsnArg arg = insn.getArg(i);
 			if (arg.isInsnWrap()) {
 				InsnNode wrapInsn = ((InsnWrapArg) arg).getWrapInsn();
-				replaceWrapped(mth, ev, wrapInsn, decrypted, builtArrays);
-				ConstStringNode repl = tryReplace(mth, ev, wrapInsn, decrypted, builtArrays);
+				replaceWrapped(mth, ev, oev, wrapInsn, decrypted, builtArrays);
+				ConstStringNode repl = tryReplace(mth, ev, oev, wrapInsn, decrypted, builtArrays, outerIsLookup);
 				if (repl != null) {
 					InsnRemover.unbindArgUsage(mth, arg);
 					insn.setArg(i, InsnArg.wrapInsnIntoArg(repl));
@@ -259,14 +361,189 @@ public class StringDecryptPass implements JadxDecompilePass {
 		}
 	}
 
-	/** Try the string-decrypt path first, then interprocedural pure String-returning helper folding. */
-	private @Nullable ConstStringNode tryReplace(MethodNode mth, Evaluator ev, InsnNode insn,
-			List<String> decrypted, List<RegisterArg> builtArrays) {
+	private static boolean isReflectiveNameLookupInvoke(InsnNode insn) {
+		if (!(insn instanceof InvokeNode)) {
+			return false;
+		}
+		return isReflectiveNameLookup(((InvokeNode) insn).getCallMth());
+	}
+
+	/**
+	 * Three-pronged replacement: (1) string-decrypt of an AES-style decryptor call, (2) folding a
+	 * String-returning call via the {@link ObjectEvaluator} (covers JDK chains
+	 * {@code BigInteger/String/StringBuilder/...} and pure app helpers), then (3) the legacy
+	 * integer-args-only {@link PureFold} path (kept for backward compatibility with the simplest
+	 * helpers). Each subsequent step runs only if the previous returned null.
+	 */
+	private @Nullable ConstStringNode tryReplace(MethodNode mth, Evaluator ev, ObjectEvaluator oev, InsnNode insn,
+			List<String> decrypted, List<RegisterArg> builtArrays, boolean consumerIsLookup) {
 		ConstStringNode repl = options.isDecryptStrings() ? tryDecrypt(mth, ev, insn, decrypted, builtArrays) : null;
+		if (repl == null && options.isFoldHelperCalls()) {
+			repl = tryFoldConstString(mth, oev, insn, decrypted, consumerIsLookup);
+		}
 		if (repl == null && options.isFoldHelperCalls()) {
 			repl = tryFoldPureString(mth, ev, insn, decrypted);
 		}
 		return repl;
+	}
+
+	/**
+	 * Replace any instruction whose result is a compile-time-constant {@code java.lang.String}.
+	 * Covers: a JDK call chain ({@code BigInteger/String/StringBuilder/...}), a {@code String}
+	 * constructor ({@code new String(byte[], "UTF-8")}), a pure app helper, and the
+	 * {@code (String) ...} {@code CHECK_CAST} (or jadx's pre-typed {@code CAST}) wrapping a
+	 * reflective {@code Method.invoke(...)}. The {@link ObjectEvaluator} carries the actual value
+	 * through the producer graph.
+	 */
+	private @Nullable ConstStringNode tryFoldConstString(MethodNode mth, ObjectEvaluator oev, InsnNode insn,
+			List<String> decrypted, boolean consumerIsLookup) {
+		if (insn instanceof BaseInvokeNode) {
+			BaseInvokeNode inv = (BaseInvokeNode) insn;
+			MethodInfo callMth = inv.getCallMth();
+			if (callMth != null && keys.decryptors().contains(callMth.getRawFullId())) {
+				return null; // an AES decryptor: owned by the decrypt path
+			}
+		}
+		if (!yieldsString(insn)) {
+			return null;
+		}
+		Object folded = oev.evalProducerDirect(insn, 0);
+		if (!(folded instanceof String)) {
+			return null;
+		}
+		String text = (String) folded;
+		// Targeted printable filter: when the folded string flows into a reflective name lookup
+		// (Class.forName, getMethod/Field/Constructor and variants), a non-printable result is
+		// provably useless (no class/member has such a name). Better to leave the call un-folded
+		// than to emit a "valid-looking but garbage" literal like Class.forName("�?")
+		// that would never resolve at runtime — those chains are obfuscator decoys and the unfolded
+		// form is friendlier for readers.
+		if (options.isSuppressDecoyLookups()
+				&& (consumerIsLookup || isConsumedByReflectiveNameLookup(insn))
+				&& !Eval.isPrintable(text)) {
+			return null;
+		}
+		decrypted.add('"' + text.replace("\\", "\\\\").replace("\"", "\\\"") + '"');
+		ConstStringNode node = new ConstStringNode(text);
+		RegisterArg result = insn.getResult();
+		if (result != null) {
+			node.setResult(result.duplicate());
+		}
+		return node;
+	}
+
+	/**
+	 * Inspect the SSA uses of {@code insn}'s result: if every use is an argument to one of the
+	 * reflective name-lookup calls ({@code Class.forName}, {@code getMethod}, {@code getField},
+	 * {@code getConstructor}, and {@code -Declared} variants), return true. A folded non-printable
+	 * string flowing into one of these calls is dead at runtime (no Java identifier contains
+	 * control characters or U+FFFD), so suppressing the fold leaves the more readable un-folded
+	 * expression in source instead of emitting an obviously-broken literal.
+	 */
+	private static boolean isConsumedByReflectiveNameLookup(InsnNode insn) {
+		RegisterArg result = insn.getResult();
+		SSAVar sVar = result != null ? result.getSVar() : null;
+		if (sVar == null) {
+			// no SSA var: the producer is inline-wrapped into its consumer's arg. The consumer is
+			// the parent of this insn in the wrap tree — walk it via getParentInsn on the result-less
+			// insn. If absent we can't tell; default to "not a lookup" so the fold still fires.
+			return false;
+		}
+		if (sVar.getUseList().isEmpty()) {
+			return false;
+		}
+		for (RegisterArg use : sVar.getUseList()) {
+			InsnNode parent = use.getParentInsn();
+			if (parent == null) {
+				return false;
+			}
+			parent = unwrapToTopInvoke(parent);
+			if (!(parent instanceof InvokeNode)) {
+				return false;
+			}
+			MethodInfo m = ((InvokeNode) parent).getCallMth();
+			if (!isReflectiveNameLookup(m)) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	/** A consumer wrap chain may bury the actual invoke node a few levels deep; walk up to it. */
+	private static InsnNode unwrapToTopInvoke(InsnNode insn) {
+		InsnNode cur = insn;
+		// CHECK_CAST / CAST / MOVE wrap their producer; their parent is the real consumer. But here
+		// we're walking the OUTER direction from a use — `use.getParentInsn()` is already the consumer
+		// of our result. If the consumer is itself wrapped (rare for invokes), there's no plain
+		// up-walk in jadx IR. Treat the consumer as-is.
+		return cur;
+	}
+
+	private static boolean isReflectiveNameLookup(MethodInfo m) {
+		if (m == null) {
+			return false;
+		}
+		String cls = m.getDeclClass().getFullName();
+		String name = m.getName();
+		if ("java.lang.Class".equals(cls)) {
+			switch (name) {
+				case "forName":
+				case "getMethod":
+				case "getDeclaredMethod":
+				case "getField":
+				case "getDeclaredField":
+				case "getConstructor":
+				case "getDeclaredConstructor":
+					return true;
+				default:
+					return false;
+			}
+		}
+		return false;
+	}
+
+	/** Thread-locally captures the current option value so the static yieldsString can read it. */
+	private static final ThreadLocal<Boolean> FOLD_OBJ_INVOKES = ThreadLocal.withInitial(() -> Boolean.TRUE);
+
+	private static boolean foldObjectReturningInvokesAllowed() {
+		return FOLD_OBJ_INVOKES.get();
+	}
+
+	/**
+	 * True iff this instruction's result is statically typed as {@code java.lang.String}. Covers
+	 * invokes / constructors / casts / moves — anything that can name a value at fold time.
+	 */
+	private static boolean yieldsString(InsnNode insn) {
+		if (insn instanceof ConstructorInsn) {
+			return "java.lang.String".equals(((ConstructorInsn) insn).getCallMth().getDeclClass().getFullName());
+		}
+		if (insn instanceof InvokeNode) {
+			ArgType ret = ((InvokeNode) insn).getCallMth().getReturnType();
+			if (ret == null || !ret.isObject()) {
+				return false;
+			}
+			String typeName = ret.getObject();
+			if ("java.lang.String".equals(typeName)) {
+				return true;
+			}
+			// Object/CharSequence-returning invokes only attempted when the broader fold is enabled —
+			// the obfuscator's reflective dispatch (Method.invoke / Field.get) returns Object even
+			// when the actual value is a String. False positives are cheap (a non-String fold result
+			// is discarded), so default-on.
+			return foldObjectReturningInvokesAllowed() && (
+					"java.lang.Object".equals(typeName) || "java.lang.CharSequence".equals(typeName));
+		}
+		switch (insn.getType()) {
+			case CHECK_CAST:
+			case CAST:
+			case MOVE: {
+				RegisterArg res = insn.getResult();
+				ArgType t = res != null ? res.getType() : null;
+				return t != null && t.isObject() && "java.lang.String".equals(t.getObject());
+			}
+			default:
+				return false;
+		}
 	}
 
 	/**
