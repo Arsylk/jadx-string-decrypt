@@ -4,6 +4,7 @@ import java.util.IdentityHashMap;
 
 import org.jetbrains.annotations.Nullable;
 
+import jadx.core.dex.info.ClassInfo;
 import jadx.core.dex.info.MethodInfo;
 import jadx.core.dex.instructions.BaseInvokeNode;
 import jadx.core.dex.instructions.ConstClassNode;
@@ -473,6 +474,42 @@ final class ObjectEvaluator {
 		AppMethodRef(MethodNode mth) {
 			this.mth = mth;
 		}
+	}
+
+	/**
+	 * Resolve the {@code Method} handle in {@code methodHandleArg} to the real method it points at, so a
+	 * {@code handle.invoke(recv, args)} can be rewritten to a direct call (see {@code DeindirectionResolver}).
+	 * Works for JDK targets (a live {@link java.lang.reflect.Method} from the reflective-bridge chain) and
+	 * app targets (a snapshotted {@link AppMethodRef}); returns null for anything else.
+	 */
+	@Nullable
+	CallTarget resolveCallTarget(InsnArg methodHandleArg, int depth) {
+		Object handle = evalObject(methodHandleArg, depth);
+		if (handle instanceof java.lang.reflect.Method) {
+			java.lang.reflect.Method m = (java.lang.reflect.Method) handle;
+			java.util.List<ArgType> params = new java.util.ArrayList<>();
+			for (Class<?> p : m.getParameterTypes()) {
+				ArgType at = TypeMap.fromClass(p);
+				if (at == null) {
+					return null;
+				}
+				params.add(at);
+			}
+			ArgType ret = TypeMap.fromClass(m.getReturnType());
+			if (ret == null) {
+				return null;
+			}
+			ClassInfo declClass = ClassInfo.fromName(mth.root(), m.getDeclaringClass().getName());
+			return new CallTarget(declClass, m.getName(), params, ret,
+					java.lang.reflect.Modifier.isStatic(m.getModifiers()));
+		}
+		if (handle instanceof AppMethodRef) {
+			MethodNode node = ((AppMethodRef) handle).mth;
+			MethodInfo mi = node.getMethodInfo();
+			return new CallTarget(mi.getDeclClass(), mi.getName(), mi.getArgumentsTypes(),
+					mi.getReturnType(), node.getAccessFlags().isStatic());
+		}
+		return null;
 	}
 
 	/** {@code appClass.getMethod/getDeclaredMethod(name, paramTypes)} → symbolic {@link AppMethodRef}. */

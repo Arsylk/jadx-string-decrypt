@@ -71,7 +71,9 @@ public class StringDecryptPass implements JadxDecompilePass {
 		this.resolvers = List.of(
 				ctx -> options.isDecryptStrings() ? tryDecrypt(ctx.mth, ctx.ev, ctx.insn, ctx.decrypted, ctx.builtArrays) : null,
 				ctx -> options.isFoldHelperCalls() ? tryFoldConstValue(ctx.oev, ctx.insn, ctx.decrypted, ctx.consumerIsLookup) : null,
-				ctx -> options.isFoldHelperCalls() ? tryFoldPureString(ctx.mth, ctx.ev, ctx.insn, ctx.decrypted) : null);
+				ctx -> options.isFoldHelperCalls() ? tryFoldPureString(ctx.mth, ctx.ev, ctx.insn, ctx.decrypted) : null,
+				// Runs last: only reflective calls the folders left un-constant get rewritten to direct calls.
+				new DeindirectionResolver(options));
 	}
 
 	@Override

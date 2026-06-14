@@ -40,7 +40,7 @@ public class StringDecryptPlugin implements JadxPlugin {
 	 * {@link BuildInfo#VERSION} (which gradle writes at build time from {@code project.version});
 	 * the two values must match — if they ever drift it means the source and the jar are out of sync.
 	 */
-	public static final String VERSION = "1.4.1";
+	public static final String VERSION = "1.5.0";
 
 	/** Minimum jadx version this plugin is built/tested against (surfaced via {@link JadxPluginInfo}). */
 	public static final String REQUIRED_JADX_VERSION = "1.5.2, r0";
