@@ -10,7 +10,7 @@ import jadx.core.dex.info.MethodInfo;
 import jadx.core.dex.instructions.ArithOp;
 import jadx.core.dex.instructions.IfOp;
 import jadx.core.dex.instructions.args.ArgType;
-import jadx.core.dex.nodes.RootNode;
+import jadx.plugins.stringdecrypt.eval.TypeMap;
 import jadx.plugins.stringdecrypt.jdk.JdkInterpreter;
 
 /**
@@ -45,12 +45,13 @@ final class PureFold {
 	private static final Object NULL = new Object();
 
 	/**
-	 * Mutable slot for a {@code new-instance} object. JVM-compiled code {@code dup}s the uninitialized
-	 * reference (modelled as MOVE), so several registers alias the same not-yet-built object; the
-	 * {@code <init>} call writes through this shared holder so every alias observes the built string.
+	 * Mutable slot for a {@code new-instance} object (any constructed JDK value — {@code String},
+	 * {@code BigInteger}, {@code StringBuilder}, ...). Compiled code aliases the uninitialized
+	 * reference across registers (modelled as MOVE); the {@code <init>} call writes through this
+	 * shared holder so every alias observes the built object.
 	 */
-	private static final class StrHolder {
-		String value;
+	private static final class Holder {
+		Object value;
 	}
 
 	private final KeyData keys;
@@ -87,7 +88,7 @@ final class PureFold {
 	}
 
 	@Nullable
-	Object foldCall(RootNode root, jadx.core.dex.instructions.InvokeNode invoke, Object[] args, int depth) {
+	Object foldCall(jadx.core.dex.instructions.InvokeNode invoke, Object[] args, int depth) {
 		return foldCall(invoke.getCallMth(), args, depth);
 	}
 
@@ -115,8 +116,11 @@ final class PureFold {
 						return null;
 					}
 					Object r = value(reg, op.args[0]);
-					if (r instanceof StrHolder) {
-						return ((StrHolder) r).value;
+					if (r == TypeMap.UNRESOLVED) {
+						return null; // never return an unresolved value as if it were a constant
+					}
+					if (r instanceof Holder) {
+						return ((Holder) r).value;
 					}
 					if (r instanceof ArrVal) {
 						return unboxArr((ArrVal) r);
@@ -132,24 +136,33 @@ final class PureFold {
 					break;
 				}
 				case CONST_STR: {
-					// CONST_STR loads a string literal into a register; snapshotted as a single literal arg.
-					if (op.args.length < 1 || !op.args[0].literal) {
+					// The snapshot carries the literal text as the op payload (obfuscators build helper
+					// strings like "toCharArray" and feed them to reflective getMethod/forName calls).
+					if (!(op.payload instanceof String)) {
 						return null;
 					}
-					// Snapshot represents the literal text via a side channel — we keep CONST_STR opaque for
-					// now (none of the obfuscation in scope uses it inside a helper body). Refuse if seen.
-					return null;
+					put(reg, op, op.payload);
+					break;
+				}
+				case CONST_CLASS: {
+					// SomeClass.class — root of a reflective bridge inside the helper (getMethod/...).
+					Object cls = resolveConstClass(op.argType);
+					if (cls == null) {
+						return null;
+					}
+					put(reg, op, cls);
+					break;
 				}
 				case MOVE:
 					put(reg, op, value(reg, op.args[0]));
 					break;
-				case CAST: {
+				case CAST:
+				case CHECK_CAST: {
 					Object src = value(reg, op.args[0]);
 					if (src instanceof Long) {
 						put(reg, op, op.argType != null ? Eval.extend(op.argType, (Long) src) : src);
 					} else {
-						// reference cast (CHECK_CAST is a separate type, but some snapshots see CAST on refs)
-						put(reg, op, src);
+						put(reg, op, src); // reference cast: carry the object through unchanged
 					}
 					break;
 				}
@@ -222,43 +235,83 @@ final class PureFold {
 				case AGET: {
 					Object arr = value(reg, op.args[0]);
 					Long idx = asLong(value(reg, op.args[1]));
-					if (!(arr instanceof ArrVal) || idx == null) {
+					if (idx == null) {
 						return null;
 					}
-					ArrVal av = (ArrVal) arr;
 					int i = idx.intValue();
-					if (i < 0 || i >= av.data.length) {
-						return null;
+					if (arr instanceof ArrVal) {
+						ArrVal av = (ArrVal) arr;
+						if (i < 0 || i >= av.data.length) {
+							return null;
+						}
+						put(reg, op, av.data[i]);
+						break;
 					}
-					put(reg, op, av.data[i]);
-					break;
+					if (arr instanceof Object[]) {
+						Object[] oa = (Object[]) arr;
+						if (i < 0 || i >= oa.length) {
+							return null;
+						}
+						put(reg, op, boxIncoming(oa[i]));
+						break;
+					}
+					return null;
 				}
 				case NEW_ARRAY: {
 					ArgType elem = op.argType;
 					Long size = asLong(value(reg, op.args[0]));
-					if (elem == null || !Eval.isIntegral(elem) || size == null || size < 0 || size > keys.maxArraySize()) {
+					if (elem == null || size == null || size < 0 || size > keys.maxArraySize()) {
 						return null;
 					}
-					put(reg, op, new ArrVal(new long[size.intValue()], elem));
+					if (Eval.isIntegral(elem)) {
+						put(reg, op, new ArrVal(new long[size.intValue()], elem));
+					} else {
+						// object array (e.g. new Object[]{...} / new Class[]{...} feeding a reflective call):
+						// hold real Java values so APUT/AGET and the JDK boundary see ordinary objects.
+						put(reg, op, new Object[size.intValue()]);
+					}
+					break;
+				}
+				case FILL_ARRAY: {
+					Object arr = value(reg, op.args[0]);
+					if (!(arr instanceof ArrVal) || !(op.payload instanceof long[])) {
+						return null;
+					}
+					ArrVal av = (ArrVal) arr;
+					long[] data = (long[]) op.payload;
+					for (int i = 0; i < data.length && i < av.data.length; i++) {
+						av.data[i] = Eval.extend(av.elem, data[i]);
+					}
 					break;
 				}
 				case APUT: {
 					Object arr = value(reg, op.args[0]);
 					Long idx = asLong(value(reg, op.args[1]));
-					Long val = asLong(value(reg, op.args[2]));
-					if (!(arr instanceof ArrVal) || idx == null || val == null) {
+					if (idx == null) {
 						return null;
 					}
-					ArrVal av = (ArrVal) arr;
 					int i = idx.intValue();
-					if (i < 0 || i >= av.data.length) {
-						return null;
+					if (arr instanceof ArrVal) {
+						ArrVal av = (ArrVal) arr;
+						Long val = asLong(value(reg, op.args[2]));
+						if (val == null || i < 0 || i >= av.data.length) {
+							return null;
+						}
+						av.data[i] = Eval.extend(av.elem, val);
+						break;
 					}
-					av.data[i] = Eval.extend(av.elem, val);
-					break;
+					if (arr instanceof Object[]) {
+						Object[] oa = (Object[]) arr;
+						if (i < 0 || i >= oa.length) {
+							return null;
+						}
+						oa[i] = unboxOutgoing(value(reg, op.args[2]));
+						break;
+					}
+					return null;
 				}
 				case NEW_INSTANCE:
-					put(reg, op, new StrHolder()); // a mutable slot; filled at its String.<init> invoke
+					put(reg, op, new Holder()); // a mutable slot; filled at its <init> invoke
 					break;
 				case INVOKE: {
 					pendingResult = execInvoke(reg, op, depth);
@@ -281,17 +334,21 @@ final class PureFold {
 	private Object execInvoke(Map<Integer, Object> reg, MethodBody.Op op, int depth) {
 		MethodInfo callMth = op.callMth;
 		String declClass = callMth.getDeclClass().getFullName();
-		// new String(char[]) / new String(char[], int, int): build the string in the instance register
-		if ("<init>".equals(callMth.getName()) && "java.lang.String".equals(declClass)) {
-			if (op.args.length < 2) {
+		// <init>: construct the object and write it into the new-instance holder (every aliased
+		// register then observes the built value). new String(char[]) keeps a direct fast path for
+		// char fidelity; everything else (BigInteger(byte[]), StringBuilder(String), ...) is built
+		// through the JDK handler's constructor.
+		if ("<init>".equals(callMth.getName())) {
+			if (op.args.length < 1) {
 				return NULL;
 			}
 			Object instance = value(reg, op.args[0]);
-			Object arr = value(reg, op.args[1]);
-			if (!(instance instanceof StrHolder)) {
+			if (!(instance instanceof Holder)) {
 				return NULL;
 			}
-			if (arr instanceof ArrVal) {
+			Holder holder = (Holder) instance;
+			Object arr = op.args.length >= 2 ? value(reg, op.args[1]) : null;
+			if ("java.lang.String".equals(declClass) && arr instanceof ArrVal && ArgType.CHAR.equals(((ArrVal) arr).elem)) {
 				ArrVal av = (ArrVal) arr;
 				int off = 0;
 				int len = av.data.length;
@@ -311,10 +368,28 @@ final class PureFold {
 				for (int i = 0; i < len; i++) {
 					chars[i] = (char) av.data[off + i];
 				}
-				((StrHolder) instance).value = new String(chars);
+				holder.value = new String(chars);
 				return null; // result is the instance, not a move-result
 			}
-			// Fall through: defer to JDK reflective <init> for byte[]/etc forms
+			if (jdk.handles(declClass)) {
+				Object[] ctorArgs = new Object[op.args.length - 1];
+				for (int i = 0; i < ctorArgs.length; i++) {
+					ctorArgs[i] = unboxOutgoing(value(reg, op.args[1 + i]));
+				}
+				Object built = jdk.invoke(callMth, null, ctorArgs); // ctor: handler creates the instance
+				if (built == null) {
+					return NULL;
+				}
+				holder.value = built;
+				return null;
+			}
+			return NULL;
+		}
+		// setAccessible(...) on a reflective handle is a pure no-op for constant interpretation (we
+		// already set it ourselves when invoking). Return a real null (success, no move-result) rather
+		// than the NULL refuse-sentinel so the obfuscator's mandatory setAccessible call doesn't abort.
+		if ("setAccessible".equals(callMth.getName())) {
+			return null;
 		}
 		// Recurse into another pure static app method (only if it was snapshotted)
 		MethodBody callee = keys.bodies().get(callMth.getRawFullId());
@@ -352,6 +427,27 @@ final class PureFold {
 		return NULL; // unknown / impure call -> refuse
 	}
 
+	/**
+	 * Resolve a {@code CONST_CLASS} type to its live {@link Class}, gated to JDK-modelled types (or
+	 * primitives / arrays of them) — mirrors {@code ObjectEvaluator.resolveConstClass} so a helper
+	 * body never hands back a live {@code Class} for app code we must not reflect into.
+	 */
+	@Nullable
+	private Object resolveConstClass(@Nullable ArgType clsType) {
+		Class<?> c = TypeMap.toClass(clsType);
+		if (c == null) {
+			return null;
+		}
+		Class<?> base = c;
+		while (base.isArray()) {
+			base = base.getComponentType();
+		}
+		if (base.isPrimitive() || jdk.handles(base.getName())) {
+			return c;
+		}
+		return null;
+	}
+
 	/** Box a real Java value into the interpreter's internal representation for a register. */
 	private static Object boxIncoming(Object v) {
 		if (v == null) {
@@ -360,9 +456,11 @@ final class PureFold {
 		if (v instanceof Long) {
 			return v;
 		}
-		if (v instanceof Integer || v instanceof Short || v instanceof Byte || v instanceof Character) {
-			return (long) ((Number) v instanceof Number ? ((Number) v).longValue()
-					: (long) ((Character) v).charValue());
+		if (v instanceof Integer || v instanceof Short || v instanceof Byte) {
+			return ((Number) v).longValue();
+		}
+		if (v instanceof Character) {
+			return (long) (Character) v;
 		}
 		if (v instanceof Boolean) {
 			return ((Boolean) v) ? 1L : 0L;
@@ -375,8 +473,8 @@ final class PureFold {
 
 	/** Convert the interpreter's internal rep back to a real Java value for a JDK call boundary. */
 	private static Object unboxOutgoing(Object v) {
-		if (v instanceof StrHolder) {
-			return ((StrHolder) v).value;
+		if (v instanceof Holder) {
+			return ((Holder) v).value;
 		}
 		if (v instanceof ArrVal) {
 			return unboxArr((ArrVal) v);

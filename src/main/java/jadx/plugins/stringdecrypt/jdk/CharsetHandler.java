@@ -11,7 +11,8 @@ public final class CharsetHandler extends ReflectiveJdkHandler {
 	@Override
 	protected void registerMethods(Set<String> allow) {
 		allow.add("forName");
-		allow.add("defaultCharset");
+		// NOTE: Charset.defaultCharset() is deliberately NOT folded — it returns the *host* JVM's
+		// default charset (environment-dependent), so its value would differ from the target device.
 		allow.add("name");
 		allow.add("displayName");
 		allow.add("aliases");

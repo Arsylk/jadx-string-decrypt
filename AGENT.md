@@ -32,6 +32,8 @@ decryption is discarded by a printable-result check.
 2. **Decompile pass (`StringDecryptPass`)** — per method:
    - Folds every compile-time-constant numeric/boolean expression to its literal (the headline
      generic feature), including constants reachable only through pure helper calls.
+   - Replaces representable constant helper results with typed jadx IR for strings, scalars,
+     primitive/object arrays (including `char[]`), and resolved `Class<?>` constants.
    - Decrypts resolvable string-decryptor calls whose `byte[]` argument is constant.
    - Removes the now-dead feeder instructions (table reads, byte-array build, folded arithmetic).
 
@@ -78,7 +80,7 @@ jadx plugins --install github:Arsylk:jadx-string-decrypt
 
 # C. from a local build:
 ./gradlew jar
-jadx plugins --install-jar build/libs/jadx-string-decrypt-1.0.1.jar
+jadx plugins --install-jar build/libs/jadx-string-decrypt-1.3.0.jar
 
 # verify
 jadx plugins --list      # expect "string-decrypt  Constant Deobfuscator vX.Y.Z"

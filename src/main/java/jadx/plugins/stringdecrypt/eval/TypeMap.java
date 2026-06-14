@@ -28,6 +28,14 @@ public final class TypeMap {
 	/** Sentinel passed by the evaluator for a literal {@code null} reference. */
 	public static final Object NULL_REF = new Object();
 
+	/**
+	 * Sentinel for an argument the evaluator could not resolve (distinct from a real {@code null}). It
+	 * may flow into a pure-helper slot the callee never reads (an obfuscator decoy) — but the moment
+	 * any computation actually consumes it, the fold must refuse rather than silently treating it as a
+	 * concrete value. {@link #coerce} rejects it so it can never reach a JDK call as a real argument.
+	 */
+	public static final Object UNRESOLVED = new Object();
+
 	/** Integral types the evaluator's int-path can fold (everything else routes through evalObject). */
 	public static boolean isIntegerLike(ArgType type) {
 		return ArgType.BOOLEAN.equals(type) || ArgType.BYTE.equals(type) || ArgType.CHAR.equals(type)
@@ -93,12 +101,55 @@ public final class TypeMap {
 		}
 		if (t.isObject()) {
 			try {
-				return Class.forName(t.getObject());
+				return Class.forName(t.getObject(), false, ClassLoader.getSystemClassLoader());
 			} catch (Throwable e) {
 				return null;
 			}
 		}
 		return null;
+	}
+
+	/**
+	 * Map a real JVM {@link Class} produced by the evaluator back to jadx's IR type model. This
+	 * intentionally records only the class name / descriptor shape; no {@code Class} object leaks
+	 * past the evaluator boundary.
+	 */
+	@Nullable
+	public static ArgType fromClass(Class<?> cls) {
+		if (cls == null) {
+			return null;
+		}
+		if (cls == boolean.class) {
+			return ArgType.BOOLEAN;
+		}
+		if (cls == byte.class) {
+			return ArgType.BYTE;
+		}
+		if (cls == char.class) {
+			return ArgType.CHAR;
+		}
+		if (cls == short.class) {
+			return ArgType.SHORT;
+		}
+		if (cls == int.class) {
+			return ArgType.INT;
+		}
+		if (cls == long.class) {
+			return ArgType.LONG;
+		}
+		if (cls == float.class) {
+			return ArgType.FLOAT;
+		}
+		if (cls == double.class) {
+			return ArgType.DOUBLE;
+		}
+		if (cls == void.class) {
+			return ArgType.VOID;
+		}
+		if (cls.isArray()) {
+			return ArgType.parse(cls.getName());
+		}
+		return ArgType.object(cls.getName());
 	}
 
 	/**
@@ -108,6 +159,9 @@ public final class TypeMap {
 	 * literal {@link #NULL_REF}. Returns {@link #COERCE_FAILED} for anything else.
 	 */
 	public static Object coerce(Class<?> target, @Nullable Object src) {
+		if (src == UNRESOLVED) {
+			return COERCE_FAILED; // an unresolved value must never reach a real call argument
+		}
 		if (src == NULL_REF) {
 			return target.isPrimitive() ? COERCE_FAILED : null;
 		}

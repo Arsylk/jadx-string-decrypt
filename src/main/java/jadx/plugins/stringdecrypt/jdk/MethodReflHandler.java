@@ -80,6 +80,9 @@ public final class MethodReflHandler implements JdkClassHandler {
 			return null;
 		}
 		Object target = args.length >= 1 ? args[0] : null;
+		if (ReflectiveJdkHandler.isIdentityNondeterministic(target, m.getName())) {
+			return null; // Object-identity hashCode/toString on a non-overriding receiver -> not constant
+		}
 		Object[] callArgs;
 		if (args.length >= 2 && args[1] instanceof Object[]) {
 			callArgs = (Object[]) args[1];

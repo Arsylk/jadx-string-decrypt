@@ -79,12 +79,33 @@ public abstract class ReflectiveJdkHandler implements JdkClassHandler {
 			if (m == null) {
 				return null;
 			}
+			if (isIdentityNondeterministic(instance, name)) {
+				return null;
+			}
 			m.setAccessible(true);
 			return m.invoke(instance, coerced);
 		} catch (InvocationTargetException ite) {
 			return null; // a guarded throw (e.g. NumberFormatException) -> can't fold, refuse
 		} catch (Throwable t) {
 			return null;
+		}
+	}
+
+	/**
+	 * True iff invoking {@code name} on {@code instance} would dispatch to {@link Object}'s own
+	 * implementation (the runtime class doesn't override it). Folding {@code hashCode()} /
+	 * {@code toString()} in that case is unsound: both derive from the per-run identity hash, so the
+	 * "constant" would change on every execution and never match the target device. Classes that
+	 * override them (String, BigInteger, StringBuilder.toString, ...) fold normally.
+	 */
+	public static boolean isIdentityNondeterministic(@Nullable Object instance, String name) {
+		if (instance == null || (!"hashCode".equals(name) && !"toString".equals(name))) {
+			return false;
+		}
+		try {
+			return instance.getClass().getMethod(name).getDeclaringClass() == Object.class;
+		} catch (NoSuchMethodException e) {
+			return true; // can't prove it's overridden -> refuse, stay sound
 		}
 	}
 

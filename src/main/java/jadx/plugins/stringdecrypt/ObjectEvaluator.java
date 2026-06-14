@@ -6,6 +6,7 @@ import org.jetbrains.annotations.Nullable;
 
 import jadx.core.dex.info.MethodInfo;
 import jadx.core.dex.instructions.BaseInvokeNode;
+import jadx.core.dex.instructions.ConstClassNode;
 import jadx.core.dex.instructions.ConstStringNode;
 import jadx.core.dex.instructions.FilledNewArrayNode;
 import jadx.core.dex.instructions.InsnType;
@@ -18,6 +19,7 @@ import jadx.core.dex.instructions.args.RegisterArg;
 import jadx.core.dex.instructions.args.SSAVar;
 import jadx.core.dex.instructions.mods.ConstructorInsn;
 import jadx.core.dex.nodes.BlockNode;
+import jadx.core.dex.nodes.ClassNode;
 import jadx.core.dex.nodes.InsnNode;
 import jadx.core.dex.nodes.MethodNode;
 import jadx.plugins.stringdecrypt.eval.TypeMap;
@@ -142,6 +144,8 @@ final class ObjectEvaluator {
 		switch (insn.getType()) {
 			case CONST_STR:
 				return ((ConstStringNode) insn).getString();
+			case CONST_CLASS:
+				return resolveConstClass(((ConstClassNode) insn).getClsType());
 			case MOVE:
 			case CAST:
 			case CHECK_CAST:
@@ -169,12 +173,11 @@ final class ObjectEvaluator {
 	 * object-element arrays ({@code String[]}, {@code Class[]}, {@code Object[]}, ...) are
 	 * reconstructed here by walking the {@code FILLED_NEW_ARRAY} args or by following the
 	 * {@code NEW_ARRAY} + {@code APUT} chain and evaluating each element via {@link #evalObject}.
-	 */
-	/**
-	 * Resolve a register holding any kind of constant array. {@code arrReg} may be null when the
-	 * array is constructed inline (a wrap arg without a named result reg) — in that case we
-	 * recover the element type from the {@link FilledNewArrayNode} itself and skip the SSA-driven
-	 * APUT scan (no APUTs can target an unnamed temp anyway).
+	 *
+	 * <p>
+	 * {@code arrReg} may be null when the array is constructed inline (a wrap arg without a named
+	 * result reg) — then we recover the element type from the {@link FilledNewArrayNode} itself and
+	 * skip the SSA-driven APUT scan (no APUTs can target an unnamed temp anyway).
 	 */
 	@Nullable
 	private Object resolveArrayProducer(@Nullable RegisterArg arrReg, InsnNode assignInsn, int depth) {
@@ -205,7 +208,11 @@ final class ObjectEvaluator {
 			int n = fa.getArgsCount();
 			Object[] out = (Object[]) java.lang.reflect.Array.newInstance(javaEl, n);
 			for (int i = 0; i < n; i++) {
-				out[i] = evalObject(fa.getArg(i), depth + 1);
+				Object v = evalArrayElement(fa.getArg(i), depth + 1);
+				if (v == UNRESOLVED_ARRAY_ELEMENT) {
+					return null;
+				}
+				out[i] = v;
 			}
 			return out;
 		}
@@ -230,11 +237,50 @@ final class ObjectEvaluator {
 						if (i < 0 || i >= out.length) {
 							return null;
 						}
-						out[i] = evalObject(insn.getArg(2), depth + 1);
+						Object v = evalArrayElement(insn.getArg(2), depth + 1);
+						if (v == UNRESOLVED_ARRAY_ELEMENT) {
+							return null;
+						}
+						out[i] = v;
 					}
 				}
 			}
 			return out;
+		}
+		return null;
+	}
+
+	private static final Object UNRESOLVED_ARRAY_ELEMENT = new Object();
+
+	private Object evalArrayElement(InsnArg arg, int depth) {
+		Object v = evalObject(arg, depth);
+		if (v == null) {
+			return UNRESOLVED_ARRAY_ELEMENT;
+		}
+		return v == TypeMap.NULL_REF ? null : v;
+	}
+
+	/**
+	 * Resolve a {@code CONST_CLASS} ({@code SomeClass.class}) to its live {@link Class}. This is the
+	 * root of nearly every reflective bridge an obfuscator emits ({@code StringBuilder.class
+	 * .getConstructor(...)}, {@code Object.class.getMethod("toString")}, ...); without it those chains
+	 * dead-end at their first link. Gated to types the {@link JdkInterpreter} actually models (or
+	 * primitives / arrays of them) so we never hand back a live {@code Class} for app code we must not
+	 * reflect into — app {@code .class} literals stay un-folded. Downstream reflective invokes are
+	 * separately gated, so this only widens what can be <em>read</em>, never what gets executed.
+	 */
+	@Nullable
+	private Object resolveConstClass(ArgType clsType) {
+		Class<?> c = TypeMap.toClass(clsType);
+		if (c == null) {
+			return null;
+		}
+		Class<?> base = c;
+		while (base.isArray()) {
+			base = base.getComponentType();
+		}
+		if (base.isPrimitive() || jdk.handles(base.getName())) {
+			return c;
 		}
 		return null;
 	}
@@ -368,17 +414,15 @@ final class ObjectEvaluator {
 		}
 
 		String declClass = callMth.getDeclClass().getFullName();
+		String name = callMth.getName();
 		if (!jdk.handles(declClass)) {
 			return null;
 		}
 		int firstArg;
 		Object instance;
-		if (ctor) {
+		if (ctor || isStatic) {
 			firstArg = 0;
-			instance = null; // handler's constructor path creates the instance
-		} else if (isStatic) {
-			firstArg = 0;
-			instance = null;
+			instance = null; // handler's constructor path creates the instance / static call
 		} else {
 			firstArg = 1;
 			instance = evalObject(inv.getArg(0), depth + 1);
@@ -386,11 +430,186 @@ final class ObjectEvaluator {
 				return null;
 			}
 		}
+		// Symbolic reflection over app classes: an obfuscator routes a call to its own (snapshotted)
+		// decryptor helper through `Class.forName("<app cls>").getDeclaredMethod(name,..).invoke(..)`.
+		// The host JVM can't load app code, so we model the class/method as jadx IR nodes and run a
+		// snapshotted helper's reflective invoke through the same interpreter a direct call uses.
+		if (instance instanceof AppClassRef && "java.lang.Class".equals(declClass)) {
+			return symbolicClassMethod((AppClassRef) instance, name, inv, depth);
+		}
+		if (instance instanceof AppMethodRef && "java.lang.reflect.Method".equals(declClass) && "invoke".equals(name)) {
+			return symbolicMethodInvoke((AppMethodRef) instance, inv, depth);
+		}
 		Object[] args = collectArgs(inv, firstArg, depth);
 		if (args == null) {
 			return null;
 		}
-		return jdk.invoke(callMth, instance, args);
+		Object result = jdk.invoke(callMth, instance, args);
+		// JDK Class.forName refused the name (not a whitelisted JDK class): if it names a class jadx
+		// loaded from the app, hand back a symbolic ref so the chain above can continue.
+		if (result == null && isStatic && "forName".equals(name) && "java.lang.Class".equals(declClass)
+				&& args.length >= 1 && args[0] instanceof String) {
+			ClassNode node = mth.root().resolveClass((String) args[0]);
+			if (node != null) {
+				return new AppClassRef(node);
+			}
+		}
+		return result;
+	}
+
+	/** Symbolic ref to a class jadx loaded from the app (not host-loadable for reflection). */
+	private static final class AppClassRef {
+		final ClassNode cls;
+
+		AppClassRef(ClassNode cls) {
+			this.cls = cls;
+		}
+	}
+
+	/** Symbolic ref to a resolved app {@link MethodNode} (the target of a reflective {@code invoke}). */
+	private static final class AppMethodRef {
+		final MethodNode mth;
+
+		AppMethodRef(MethodNode mth) {
+			this.mth = mth;
+		}
+	}
+
+	/** {@code appClass.getMethod/getDeclaredMethod(name, paramTypes)} → symbolic {@link AppMethodRef}. */
+	@Nullable
+	private Object symbolicClassMethod(AppClassRef ref, String name, BaseInvokeNode inv, int depth) {
+		if (!"getDeclaredMethod".equals(name) && !"getMethod".equals(name)) {
+			return null; // getField / getConstructor on app classes not modelled yet
+		}
+		Object[] a = collectArgs(inv, 1, depth);
+		if (a == null || a.length < 1 || !(a[0] instanceof String)) {
+			return null;
+		}
+		Class<?>[] params = a.length >= 2 ? asClassArray(a[1]) : new Class<?>[0];
+		if (params == null) {
+			return null;
+		}
+		MethodNode m = findAppMethod(ref.cls, (String) a[0], params);
+		return m != null ? new AppMethodRef(m) : null;
+	}
+
+	/** {@code appMethod.invoke(receiver, args)} → fold via the helper snapshot (only if snapshotted). */
+	@Nullable
+	private Object symbolicMethodInvoke(AppMethodRef ref, BaseInvokeNode inv, int depth) {
+		MethodInfo mi = ref.mth.getMethodInfo();
+		if (!keys.bodies().containsKey(mi.getRawFullId())) {
+			return null; // not a foldable pure helper -> leave the reflective call as-is
+		}
+		// Method.invoke(receiver, Object[] args): the varargs array is the call's arg index 2
+		// (arg0 = the Method handle/receiver of `.invoke`, arg1 = the invoke target receiver). Resolve
+		// it allowing null elements: obfuscators pass an unresolvable decoy (e.g. System.out) the helper
+		// never reads, so a single unresolved element must not poison the whole arg list.
+		Object[] callArgs = inv.getArgsCount() >= 3 ? resolveVarargsAllowingNull(inv.getArg(2), depth) : new Object[0];
+		if (callArgs == null) {
+			return null;
+		}
+		return helperFold.foldCall(mi, callArgs, depth + 1);
+	}
+
+	/**
+	 * Resolve a constant {@code Object[]} (the varargs array of a reflective {@code invoke}) element by
+	 * element, mapping both {@link TypeMap#NULL_REF} and an unresolved element to Java {@code null}.
+	 * Unlike {@link #resolveArrayProducer} this never fails on a single unresolved element — the helper
+	 * interpreter refuses on its own if it actually reads one.
+	 */
+	@Nullable
+	private Object[] resolveVarargsAllowingNull(InsnArg arrayArg, int depth) {
+		InsnNode prod;
+		if (arrayArg.isInsnWrap()) {
+			prod = ((InsnWrapArg) arrayArg).getWrapInsn();
+		} else if (arrayArg instanceof RegisterArg) {
+			prod = ((RegisterArg) arrayArg).getAssignInsn();
+		} else {
+			return null;
+		}
+		if (prod == null) {
+			return null;
+		}
+		if (prod instanceof FilledNewArrayNode) {
+			FilledNewArrayNode fa = (FilledNewArrayNode) prod;
+			Object[] out = new Object[fa.getArgsCount()];
+			for (int i = 0; i < out.length; i++) {
+				out[i] = allowNull(evalObject(fa.getArg(i), depth + 1));
+			}
+			return out;
+		}
+		if (prod.getType() == InsnType.NEW_ARRAY) {
+			Long size = intEval.evalInt(prod.getArg(0), 0);
+			if (size == null || size < 0 || size > keys.maxArraySize()) {
+				return null;
+			}
+			Object[] out = new Object[size.intValue()];
+			RegisterArg arrReg = prod.getResult();
+			if (arrReg == null || arrReg.getSVar() == null) {
+				return out;
+			}
+			for (BlockNode block : mth.getBasicBlocks()) {
+				for (InsnNode insn : block.getInstructions()) {
+					if (insn.getType() == InsnType.APUT && insn.getArg(0).isSameVar(arrReg)) {
+						Long idx = intEval.evalInt(insn.getArg(1), 0);
+						if (idx == null || idx < 0 || idx >= out.length) {
+							return null;
+						}
+						out[idx.intValue()] = allowNull(evalObject(insn.getArg(2), depth + 1));
+					}
+				}
+			}
+			return out;
+		}
+		return null;
+	}
+
+	/** Match an app method by name + exact (host-resolvable) parameter types; null if absent/ambiguous. */
+	@Nullable
+	private MethodNode findAppMethod(ClassNode cls, String name, Class<?>[] params) {
+		MethodNode match = null;
+		for (MethodNode m : cls.getMethods()) {
+			MethodInfo mi = m.getMethodInfo();
+			if (!mi.getName().equals(name) || mi.getArgumentsTypes().size() != params.length) {
+				continue;
+			}
+			boolean ok = true;
+			for (int i = 0; i < params.length; i++) {
+				Class<?> pc = TypeMap.toClass(mi.getArgumentsTypes().get(i));
+				if (pc == null || !pc.equals(params[i])) {
+					ok = false;
+					break;
+				}
+			}
+			if (ok) {
+				if (match != null) {
+					return null; // ambiguous overloads -> refuse
+				}
+				match = m;
+			}
+		}
+		return match;
+	}
+
+	private static @Nullable Class<?>[] asClassArray(Object v) {
+		if (v == null) {
+			return new Class<?>[0];
+		}
+		if (v instanceof Class<?>[]) {
+			return (Class<?>[]) v;
+		}
+		if (v instanceof Object[]) {
+			Object[] in = (Object[]) v;
+			Class<?>[] out = new Class<?>[in.length];
+			for (int i = 0; i < in.length; i++) {
+				if (!(in[i] instanceof Class<?>)) {
+					return null;
+				}
+				out[i] = (Class<?>) in[i];
+			}
+			return out;
+		}
+		return null;
 	}
 
 	@Nullable
@@ -409,30 +628,26 @@ final class ObjectEvaluator {
 		return args;
 	}
 
-	/** Like {@link #collectArgs}, but unresolved args land as {@code null} rather than failing. */
+	/**
+	 * Like {@link #collectArgs}, but a single unresolved arg does not fail the whole list — it lands
+	 * as {@link TypeMap#UNRESOLVED} (a real {@code null} literal stays {@code null}). A pure-helper
+	 * slot that is never read (a decoy) folds anyway; the interpreter refuses the moment it actually
+	 * consumes an {@code UNRESOLVED}, so unresolved is never silently conflated with {@code null}.
+	 */
 	private Object[] collectArgsAllowingNull(BaseInvokeNode inv, int start, int depth) {
 		int total = inv.getArgsCount();
 		Object[] args = new Object[total - start];
 		for (int i = 0; i < args.length; i++) {
-			args[i] = evalObject(inv.getArg(start + i), depth + 1);
+			args[i] = allowNull(evalObject(inv.getArg(start + i), depth + 1));
 		}
 		return args;
 	}
 
-	/** Type test: does this producer instruction yield an object (or String) value? */
-	static boolean producesObject(InsnNode insn) {
-		if (insn == null) {
-			return false;
+	/** Map an {@code evalObject} result to a helper-arg slot: unresolved → UNRESOLVED, NULL_REF → null. */
+	private static Object allowNull(Object v) {
+		if (v == null) {
+			return TypeMap.UNRESOLVED;
 		}
-		InsnType t = insn.getType();
-		if (t == InsnType.CONST_STR || t == InsnType.NEW_ARRAY || t == InsnType.FILLED_NEW_ARRAY
-				|| t == InsnType.CONSTRUCTOR) {
-			return true;
-		}
-		if (t == InsnType.INVOKE) {
-			ArgType ret = ((InvokeNode) insn).getCallMth().getReturnType();
-			return ret != null && (ret.isObject() || ret.isArray());
-		}
-		return false;
+		return v == TypeMap.NULL_REF ? null : v;
 	}
 }

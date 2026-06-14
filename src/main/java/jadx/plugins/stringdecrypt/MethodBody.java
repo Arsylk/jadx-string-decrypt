@@ -49,16 +49,24 @@ final class MethodBody {
 		final InsnType type;
 		final int resultReg; // -1 if none
 		final Arg[] args;
-		final @Nullable ArgType argType; // CAST target / NEW_ARRAY element type
+		final @Nullable ArgType argType; // CAST/CHECK_CAST target / NEW_ARRAY / CONST_CLASS element type
 		final @Nullable ArithOp arithOp; // ARITH operator
 		final @Nullable FieldInfo field; // SGET field
 		final @Nullable MethodInfo callMth; // INVOKE target
 		final @Nullable IfOp ifOp; // IF comparator
 		final int branchTarget; // op-array index (resolved from dex offset); -1 if not a branch
+		/** CONST_STR text (String) or FILL_ARRAY payload (long[]); null otherwise. */
+		final @Nullable Object payload;
 
 		Op(InsnType type, int resultReg, Arg[] args, @Nullable ArgType argType,
 				@Nullable ArithOp arithOp, @Nullable FieldInfo field, @Nullable MethodInfo callMth,
 				@Nullable IfOp ifOp, int branchTarget) {
+			this(type, resultReg, args, argType, arithOp, field, callMth, ifOp, branchTarget, null);
+		}
+
+		Op(InsnType type, int resultReg, Arg[] args, @Nullable ArgType argType,
+				@Nullable ArithOp arithOp, @Nullable FieldInfo field, @Nullable MethodInfo callMth,
+				@Nullable IfOp ifOp, int branchTarget, @Nullable Object payload) {
 			this.type = type;
 			this.resultReg = resultReg;
 			this.args = args;
@@ -68,6 +76,7 @@ final class MethodBody {
 			this.callMth = callMth;
 			this.ifOp = ifOp;
 			this.branchTarget = branchTarget;
+			this.payload = payload;
 		}
 	}
 

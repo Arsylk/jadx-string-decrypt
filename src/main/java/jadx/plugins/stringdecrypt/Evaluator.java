@@ -293,7 +293,7 @@ final class Evaluator {
 					}
 					args[k] = a;
 				}
-				Object r = pureFold.foldCall(mth.root(), inv, args, depth + 1);
+				Object r = pureFold.foldCall(inv, args, depth + 1);
 				return r instanceof Long ? (Long) r : null;
 			}
 			default:

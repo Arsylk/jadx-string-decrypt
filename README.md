@@ -5,9 +5,11 @@ constants** in obfuscated Android apps — and, where applicable, decrypts their
 
 Many commercial Android obfuscators replace every literal with an opaque, table-based expression
 that is nonetheless fully resolvable at compile time. This plugin reconstructs the static "key
-tables", folds the opaque expressions back to literals **everywhere** they appear (arguments,
-array sizes/indices, returns, field initializers, conditions, byte-array builds), and decrypts
-resolvable block-cipher string-decryptor calls.
+tables", folds the opaque expressions back to typed constants **everywhere** they appear
+(arguments, array sizes/indices, returns, field initializers, conditions, byte-array builds), and
+decrypts resolvable block-cipher string-decryptor calls. Folded helper/decryption pipelines can now
+materialize strings, primitive/boxed scalars, primitive or object arrays such as `char[]`, and
+resolved `Class<?>` constants when jadx can represent them safely.
 
 It is **generic**: every behaviour is driven by settings and auto-detection. Folding is sound by
 construction (only genuinely compile-time values are folded; reads of any static the plugin sees
@@ -27,13 +29,13 @@ jadx plugins --install github:Arsylk:jadx-string-decrypt
 
 # Or from a local build:
 ./gradlew jar
-jadx plugins --install-jar build/libs/jadx-string-decrypt-1.0.1.jar
+jadx plugins --install-jar build/libs/jadx-string-decrypt-1.3.0.jar
 ```
 
 Verify:
 
 ```bash
-jadx plugins --list      # "string-decrypt  Constant Deobfuscator v1.0.1"
+jadx plugins --list      # "string-decrypt  Constant Deobfuscator v1.3.0"
 jadx -d out app.apk      # default settings deobfuscate out of the box
 ```
 
@@ -144,6 +146,8 @@ Two passes, sound by construction:
 2. **Decompile pass** — per method:
    - Folds every compile-time-constant numeric/boolean expression to its literal value,
      everywhere — including expressions reachable only through pure helper calls.
+   - Replaces representable constant helper results with the matching jadx IR: strings, typed
+     scalar literals, array literals, and `Class<?>` constants.
    - Replaces resolvable string-decryptor calls with the decrypted constant string.
    - Removes the dead feeder instructions left behind (table reads, byte-array builds,
      arithmetic).
@@ -152,10 +156,11 @@ Two passes, sound by construction:
 
 Folding is **sound**: only genuinely compile-time values are folded — literals, arithmetic,
 conversions, reads of *immutable* static tables (the whole-program scan excludes any static
-written at runtime), and pure helper calls. Object `null` (which the IR represents as `0`) and
-`float` / `double` bit patterns are explicitly refused so they can never be inlined as integer
-literals. A wrong string decryption produces non-printable bytes and is discarded, so enabling
-decryption is safe even on apps that use a different scheme (it just no-ops).
+written at runtime), and pure helper calls. Object `null` (which the IR represents as `0`) is kept
+typed, and evaluated objects are converted back through jadx's `ArgType` model; values that are not
+representable or not assignable to the original result type are refused. A wrong string decryption
+produces non-printable bytes and is discarded, so enabling decryption is safe even on apps that use
+a different scheme (it just no-ops).
 
 ---
 

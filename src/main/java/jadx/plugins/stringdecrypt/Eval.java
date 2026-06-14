@@ -11,10 +11,14 @@ import javax.crypto.Cipher;
 import javax.crypto.spec.SecretKeySpec;
 
 import org.jetbrains.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import jadx.core.dex.info.FieldInfo;
 import jadx.core.dex.info.MethodInfo;
 import jadx.core.dex.instructions.ArithNode;
+import jadx.core.dex.instructions.ConstClassNode;
+import jadx.core.dex.instructions.ConstStringNode;
 import jadx.core.dex.instructions.FillArrayData;
 import jadx.core.dex.instructions.FillArrayInsn;
 import jadx.core.dex.instructions.GotoNode;
@@ -37,6 +41,8 @@ import jadx.core.dex.nodes.RootNode;
  * (static integral arrays + scalar fields) from each class's {@code <clinit>}.
  */
 final class Eval {
+
+	private static final Logger LOG = LoggerFactory.getLogger(Eval.class);
 
 	private Eval() {
 	}
@@ -128,7 +134,9 @@ final class Eval {
 			}
 			snapshotPureCandidates(cls, keys);
 		} catch (Throwable t) {
-			// ignore: a class whose constants can't be reconstructed just won't resolve
+			// a class whose constants can't be reconstructed just won't resolve — surface at debug so
+			// a genuine bug (vs. an expected un-reconstructable class) is diagnosable, not fully silent
+			LOG.debug("string-decrypt: key-data reconstruction skipped for {}", cls, t);
 		}
 		for (ClassNode inner : cls.getInnerClasses()) {
 			buildKeyData(inner, keys, detectDecryptors);
@@ -251,7 +259,9 @@ final class Eval {
 					keys.bodies().put(mth.getMethodInfo().getRawFullId(), body);
 				}
 			} catch (Throwable t) {
-				// ignore: a method that can't be snapshotted simply won't be folded
+				// a method that can't be snapshotted simply won't be folded — debug-log so an
+				// unexpected snapshot failure is visible rather than silently dropped
+				LOG.debug("string-decrypt: pure-helper snapshot skipped for {}", mth, t);
 			} finally {
 				if (!wasLoaded) {
 					mth.unload(); // restore lazy state so we don't keep thousands of bodies loaded
@@ -295,7 +305,7 @@ final class Eval {
 			if (insn == null || insn.getType() == InsnType.NOP || insn.getType() == InsnType.FILL_ARRAY_DATA) {
 				continue;
 			}
-			MethodBody.Op op = snapshotOp(insn, offsetToOpIndex);
+			MethodBody.Op op = snapshotOp(insn, offsetToOpIndex, insns);
 			if (op == null) {
 				return null;
 			}
@@ -312,7 +322,7 @@ final class Eval {
 		return new MethodBody(ops.toArray(new MethodBody.Op[0]), regs);
 	}
 
-	private static @Nullable MethodBody.Op snapshotOp(InsnNode insn, Map<Integer, Integer> offsetToOpIndex) {
+	private static @Nullable MethodBody.Op snapshotOp(InsnNode insn, Map<Integer, Integer> offsetToOpIndex, InsnNode[] insns) {
 		MethodBody.Arg[] args = new MethodBody.Arg[insn.getArgsCount()];
 		for (int i = 0; i < args.length; i++) {
 			InsnArg a = insn.getArg(i);
@@ -328,7 +338,6 @@ final class Eval {
 		switch (insn.getType()) {
 			case RETURN:
 			case CONST:
-			case CONST_STR:
 			case MOVE:
 			case NEG:
 			case NOT:
@@ -337,11 +346,36 @@ final class Eval {
 			case NEW_INSTANCE:
 			case MOVE_RESULT:
 			case ARRAY_LENGTH:
+			// MOVE_EXCEPTION/THROW belong to catch handlers the obfuscator wraps reflective calls in.
+			// They are reachable only via an exception edge, which the linear+branch interpreter never
+			// simulates; snapshotting them (rather than refusing the whole body) lets the normal path
+			// fold, and PureFold's default-refuse keeps it sound if execution ever did reach them.
+			case MOVE_EXCEPTION:
+			case THROW:
 				return new MethodBody.Op(insn.getType(), resultReg, args, null, null, null, null, null, -1);
-			case CAST: {
+			case CONST_STR:
+				return new MethodBody.Op(InsnType.CONST_STR, resultReg, args, null, null, null, null, null, -1,
+						((ConstStringNode) insn).getString());
+			case CONST_CLASS:
+				return new MethodBody.Op(InsnType.CONST_CLASS, resultReg, args,
+						((ConstClassNode) insn).getClsType(), null, null, null, null, -1);
+			case CAST:
+			case CHECK_CAST: {
 				Object idx = insn instanceof IndexInsnNode ? ((IndexInsnNode) insn).getIndex() : null;
-				return new MethodBody.Op(InsnType.CAST, resultReg, args,
+				return new MethodBody.Op(insn.getType(), resultReg, args,
 						idx instanceof ArgType ? (ArgType) idx : null, null, null, null, null, -1);
+			}
+			case FILL_ARRAY: {
+				FillArrayData fad = findFillPayload(insns, ((FillArrayInsn) insn).getTarget());
+				if (fad == null) {
+					return null;
+				}
+				List<LiteralArg> lits = fad.getLiteralArgs(fad.getElementType());
+				long[] data = new long[lits.size()];
+				for (int i = 0; i < data.length; i++) {
+					data[i] = lits.get(i).getLiteral();
+				}
+				return new MethodBody.Op(InsnType.FILL_ARRAY, resultReg, args, null, null, null, null, null, -1, data);
 			}
 			case ARITH:
 				return new MethodBody.Op(InsnType.ARITH, resultReg, args, null, ((ArithNode) insn).getOp(), null, null, null, -1);

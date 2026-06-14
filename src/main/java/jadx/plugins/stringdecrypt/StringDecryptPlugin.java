@@ -18,9 +18,9 @@ import jadx.api.plugins.JadxPluginInfo;
  * integral "key table" / scalar constant from each class's {@code <clinit>}, snapshots pure helper
  * method bodies, and scans the whole program for runtime-mutated statics (so their reads are never
  * folded).</li>
- * <li>{@link StringDecryptPass} (decompile) &mdash; folds every compile-time-constant
- * numeric/boolean expression to its literal value, optionally decrypts resolvable block-cipher
- * string-decryptor calls, and removes the now-dead feeder instructions.</li>
+ * <li>{@link StringDecryptPass} (decompile) &mdash; folds every representable compile-time-constant
+ * value to its literal IR form, optionally decrypts resolvable block-cipher string-decryptor calls,
+ * and removes the now-dead feeder instructions.</li>
  * </ul>
  *
  * <p>
@@ -40,7 +40,7 @@ public class StringDecryptPlugin implements JadxPlugin {
 	 * {@link BuildInfo#VERSION} (which gradle writes at build time from {@code project.version});
 	 * the two values must match — if they ever drift it means the source and the jar are out of sync.
 	 */
-	public static final String VERSION = "1.2.2";
+	public static final String VERSION = "1.4.1";
 
 	/** Minimum jadx version this plugin is built/tested against (surfaced via {@link JadxPluginInfo}). */
 	public static final String REQUIRED_JADX_VERSION = "1.5.2, r0";
@@ -57,7 +57,7 @@ public class StringDecryptPlugin implements JadxPlugin {
 		// Suffix the description with the UTC build timestamp from BuildInfo so the plugin list in
 		// jadx-gui (and `jadx plugins --list`) makes the exact jar provenance visible at a glance.
 		JadxPluginInfo info = new JadxPluginInfo(PLUGIN_ID, "Constant Deobfuscator v" + VERSION,
-				"Fold compile-time-constant (opaque table-based) numeric/boolean expressions to literals,"
+				"Fold compile-time-constant opaque values to literals/arrays/classes,"
 						+ " and decrypt resolvable block-cipher string calls"
 						+ " — built " + BuildInfo.BUILD_TIME);
 		info.setHomepage(HOMEPAGE);
