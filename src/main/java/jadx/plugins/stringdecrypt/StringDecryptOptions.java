@@ -30,7 +30,7 @@ public class StringDecryptOptions extends BasePluginOptionsBuilder {
 	private boolean foldReflectiveBridges = true;
 	private boolean foldObjectReturningInvokes = true;
 	private boolean suppressDecoyLookups = true;
-	private boolean deindirectReflection = true;
+	private boolean deindirectReflection = false;
 	private String decryptorClass = "";
 	private String decryptorDesc = DEFAULT_DECRYPTOR_DESC;
 	private String cipher = DEFAULT_CIPHER;
@@ -85,8 +85,8 @@ public class StringDecryptOptions extends BasePluginOptionsBuilder {
 				.setter(v -> suppressDecoyLookups = v);
 
 		boolOption(StringDecryptPlugin.PLUGIN_ID + ".deindirect-reflection")
-				.description("Rewrite resolvable reflective calls to direct calls")
-				.defaultValue(true)
+				.description("Rewrite resolvable reflective calls to direct calls (experimental)")
+				.defaultValue(false)
 				.setter(v -> deindirectReflection = v);
 
 		boolOption(StringDecryptPlugin.PLUGIN_ID + ".comments")
