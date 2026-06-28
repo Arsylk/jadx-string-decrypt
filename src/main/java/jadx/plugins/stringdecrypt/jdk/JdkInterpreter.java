@@ -42,6 +42,18 @@ public final class JdkInterpreter {
 		register(new CharsetHandler());
 		register(new StandardCharsetsHandler()); // no methods, just enables SGET on UTF_8 / ISO_8859_1 / ...
 		register(new ObjectHandler()); // virtual dispatch for toString/equals/hashCode/getClass
+		// Symmetric-cipher decryptor folding: a pure `static String dec(String)` built from Base64 +
+		// Cipher (DESede/AES/DES + SecretKeySpec/IV) is interpreted end-to-end, so its constant call
+		// sites inline to plaintext. android.util.Base64 is re-implemented (not on the host); the JCE
+		// classes are reflected (they are). See the respective handlers for the soundness argument.
+		register(new AndroidBase64Handler());
+		register(new JavaUtilBase64Handler());
+		register(new Base64DecoderHandler());
+		register(new Base64EncoderHandler());
+		register(new CipherHandler());
+		register(new CryptoSpecHandler("javax.crypto.spec.SecretKeySpec"));
+		register(new CryptoSpecHandler("javax.crypto.spec.IvParameterSpec"));
+		register(new CryptoSpecHandler("javax.crypto.spec.GCMParameterSpec"));
 		// Reflection chain (Class/Method/Constructor/Field/AccessibleObject) — folds reflective
 		// bridges back to direct calls when every link resolves to a JDK whitelist member.
 		register(new ClassHandler(this));

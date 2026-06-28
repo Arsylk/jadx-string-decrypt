@@ -65,6 +65,23 @@ public final class ClassHandler implements JdkClassHandler {
 			"toString",
 			"asSubclass");
 
+	/**
+	 * The pure, side-effect-free member-lookup methods that are safe to invoke <i>reflectively</i> (i.e.
+	 * via {@code someHandle.invoke(SomeClass.class, "name", paramTypes)}). They only return reflection
+	 * objects and never load or initialize a class, so {@link MethodReflHandler} may execute them on the
+	 * host to resolve a {@code Method}/{@code Field}/{@code Constructor} handle the obfuscator built
+	 * through a reflective {@code getMethod}. Deliberately excludes {@code forName} (which would trigger
+	 * class initialization).
+	 */
+	private static final Set<String> REFLECTIVE_LOOKUPS = Set.of(
+			"getMethod", "getDeclaredMethod", "getField", "getDeclaredField",
+			"getConstructor", "getDeclaredConstructor");
+
+	/** @see #REFLECTIVE_LOOKUPS */
+	public boolean isReflectiveLookupAllowed(String name) {
+		return REFLECTIVE_LOOKUPS.contains(name);
+	}
+
 	@Override
 	public @Nullable Object invoke(MethodInfo call, @Nullable Object instance, Object[] args) {
 		String name = call.getName();
@@ -209,10 +226,18 @@ public final class ClassHandler implements JdkClassHandler {
 				return "ZBCSIJFD".indexOf(el.charAt(0)) >= 0; // primitive descriptor letter
 			}
 			if (el.length() >= 3 && el.charAt(0) == 'L' && el.charAt(el.length() - 1) == ';') {
-				return interpreter.handles(el.substring(1, el.length() - 1).replace('/', '.'));
+				return isSafeToLoad(el.substring(1, el.length() - 1).replace('/', '.'));
 			}
 			return false;
 		}
-		return interpreter.handles(className);
+		// A class with a registered handler, or any standard JDK API class. The latter is loaded with
+		// initialize=false (see invoke), so it has no side effects — it only yields a Class constant or a
+		// reflection param/lookup type (e.g. java.math.MathContext as a getMethod parameter). Method
+		// *invocation* on an unhandled class is still refused by MethodReflHandler, so this stays sound.
+		return interpreter.handles(className) || isStandardJdkClass(className);
+	}
+
+	private static boolean isStandardJdkClass(String className) {
+		return className.startsWith("java.") || className.startsWith("javax.");
 	}
 }

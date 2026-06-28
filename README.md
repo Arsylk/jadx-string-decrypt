@@ -110,6 +110,9 @@ plugin settings). Defaults target general deobfuscation, so a fresh install need
 | `fold-consts` | `true` | fold constant numeric/boolean expressions to literals |
 | `fold-helper-calls` | `true` | also fold pure interpretable helper-method calls (interprocedural) |
 | `decrypt-strings` | `true` | decrypt resolvable block-cipher string-decryptor calls |
+| `deindirect-reflection` | `true` | rewrite resolvable reflective calls (`handle.invoke(...)`) to the direct call |
+| `cleanup-reflection` | `true` | remove dead reflective scaffolding (`X.class.getMethod(...).setAccessible` no-ops) |
+| `script-pipelines` | `true` | run user-registered `.jadx.kts` replacement pipelines (see below) |
 | `cleanup` | `true` | remove dead feeder instructions |
 | `comments` | `true` | add a method comment listing decrypted strings |
 | `decryptor-class` | `""` | restrict the decryptor to this raw class name; empty = auto-detect only |
@@ -127,6 +130,116 @@ jadx -P string-decrypt.decrypt-strings=false -d out app.apk
 # target a different appended-key cipher
 jadx -P string-decrypt.cipher=DESede/ECB/PKCS5Padding -P string-decrypt.key-tail-len=24 -d out app.apk
 ```
+
+---
+
+## Script pipelines (`.jadx.kts`)
+
+For app-specific decoders the built-ins don't recognize, a jadx script can register a **replacement
+pipeline**: you supply the app knowledge (which method, how to combine its arguments, what value
+replaces the call); the plugin does the hard jadx work (resolving compile-time values, preserving
+types, building valid IR, copying metadata, cleaning consumed array builders). You write decoding
+logic against typed `PipelineFrame` / `PipelineValue` / `PipelineResult` — not raw `InvokeNode`/`InsnArg`.
+
+```kotlin
+import jadx.plugins.stringdecrypt.PipelineResult
+import jadx.plugins.stringdecrypt.StringDecryptPlugin
+
+val jadx = getJadxInstance()
+val stringDecrypt = jadx.pluginContext.plugins()
+    .getInstance(StringDecryptPlugin::class.java)
+
+stringDecrypt.pipeline(
+    "sample-xor",                                          // a label for logs/comments
+    "da.ba.aa.fa.s(CLjava/lang/String;)Ljava/lang/String;", // exact raw method id
+) { frame ->
+    val key = frame.arg(0)?.charValue() ?: return@pipeline PipelineResult.keep()
+    val input = frame.arg(1)?.string() ?: return@pipeline PipelineResult.keep()
+    val out = input.map { ch -> (ch.code xor key.code).toChar() }.joinToString("")
+    PipelineResult.replaceString(out).cleanupArg(1).comment("\"$input\" -> \"$out\"")
+}
+```
+
+More runnable examples in [`examples/`](examples): `xor-char-string.jadx.kts`,
+`char-array-result.jadx.kts`, `class-result.jadx.kts`, and `standalone-bridge.jadx.kts` (installed-jar
+path, below).
+
+> The typed API above requires the plugin's classes on the script's compile classpath, which holds when
+> the plugin is **bundled in-tree**. When the plugin is an **installed jar** it loads in its own
+> classloader and is absent from that classpath — use the classloader-safe bridge in the next section.
+
+**API in one screen:**
+
+- **Register** — `plugin.pipeline(name, methodId, cb)` (exact raw id, fast path) or
+  `plugin.pipeline(name, matcher, cb)` with a `PipelineMatcher` (`exact/owner/name/returns/descriptor/
+  anyOf/allOf`). Returns a `PipelineRegistration` you can `disable()/enable()/remove()`.
+- **`PipelineFrame`** — `arg(i)` is the first *declared* argument (the receiver, if any, is
+  `receiver()`); `rawArg(i)` exposes the raw invoke layout. Plus `call()`, `rawFullId()`,
+  `returnType()`, `targetType()`.
+- **`PipelineValue`** — lazily + memoized: `string()`, `bytes()`, `chars()`, `intValue()`,
+  `longValue()`, `charValue()`, `booleanValue()`, `classValue()`/`classType()`, array accessors,
+  `object()`. Each returns `null` for a non-constant argument — that's the normal "decline" signal.
+- **`PipelineResult`** — `keep()` (decline), `commentOnly(msg)`, `fail(msg)`, and the typed
+  `replaceString` / `replaceChars` / `replaceBytes` / `replaceInt…` / `replaceClass` /
+  `replaceClassType` / `replaceNull` / `replaceInsn` factories; chain `.comment(...)` /
+  `.cleanupArg(i)` / `.targetType(...)`. Incompatible values (e.g. a `String` for an `int` result)
+  are refused and the original call is kept.
+
+**Order & semantics.** Pipelines run **after** the built-in decryption, folding and de-indirection —
+those are the automatic primary deobfuscation, and a pipeline operates on the already-resolved values,
+handling the calls the built-ins left. The first pipeline to `replace` wins; `keep()` continues to the
+next. Registration order is deterministic (exact-id pipelines before predicate pipelines).
+
+### Installed-jar (standalone) pipelines
+
+When the plugin is **installed** (`jadx plugins --install …`), jadx loads it in a private classloader, so
+a script can neither `import` the plugin's types nor pass a typed `ScriptPipeline` lambda — and
+`@DependsOn`-ing the jar would load a second, incompatible copy. The plugin therefore also exposes a
+**classloader-safe entry point** built from shared types only (JDK `Function`/`Map`, jadx-core `ArgType`):
+`registerPipeline(name, methodId, Function<Map,Object>)`. A script calls it reflectively and its callback
+references zero plugin types, so the split is irrelevant.
+
+```kotlin
+import jadx.core.dex.instructions.args.ArgType
+import java.util.function.Function
+
+val jadx = getJadxInstance()
+val plugin = jadx.pluginContext.plugins().getById("string-decrypt")?.pluginInstance
+    ?: error("string-decrypt not installed")
+
+fun pipeline(name: String, methodId: String, body: (Map<String, Any?>) -> Any?) =
+    plugin.javaClass.getMethod("registerPipeline", String::class.java, String::class.java, Function::class.java)
+        .invoke(plugin, name, methodId, Function<Map<String, Any?>, Any?> { body(it) })
+
+pipeline("flag-name", "a.b.Cfg.flag(Ljava/lang/String;)Ljava/lang/String;") { frame ->
+    val key = (frame["args"] as Array<*>).getOrNull(0) as? String ?: return@pipeline null
+    mapOf("0" to "ENABLED", "1" to "DISABLED")[key]   // String -> replaces the call with that literal
+}
+```
+
+The callback gets a frame `Map` (`id`/`owner`/`name`/`shortId` strings, `returnType`/`targetType`
+`ArgType`, `args` `Object[]` of resolved declared args, `receiver`) and returns: `null` to keep; a
+`String`/boxed scalar/array/`Class` to replace; a jadx `ArgType` for a `.class` literal of an app-only
+type; or a `Map` action (`value`, `classType`, `nullType`, `comment`, `cleanupArgs`, `fail`, `keep`).
+There is also a predicate overload `registerPipeline(name, Predicate<Map>, Function<Map,Object>)`. Full
+contract: `ScriptBridge` javadoc; runnable example: [`examples/standalone-bridge.jadx.kts`](examples/standalone-bridge.jadx.kts).
+
+**jadx-gui shortcut.** Right-click any class / method / field in the code view and choose **“Copy as
+string-decrypt pipeline”** to put a ready-to-paste `.jadx.kts` skeleton on the clipboard — the exact raw
+id pre-filled (a method → exact-id pipeline; a class/field → a predicate scoped to the declaring class),
+using the standalone bridge above so it runs against an installed plugin.
+
+**Caveats.**
+
+- *Classloader* — in-tree, use the **bundled** typed API; do not `@DependsOn("jadx-string-decrypt")`,
+  which loads a second copy of the API classes (a returned `PipelineResult` from a different classloader
+  is detected, logged and declined). When **installed standalone**, use the shared-type `registerPipeline`
+  bridge above — it needs no plugin types on the script classpath.
+- *Concurrency* — jadx visits methods on multiple threads, so callbacks can run concurrently. Prefer
+  pure functions; if you cache, use a thread-safe structure. A callback exception is logged and treated
+  as a decline (it never aborts decompilation).
+- *Scope* — static evaluation only; no Dex VM. If a value can't be represented as a literal / array /
+  class literal / typed null (or a caller-supplied `InsnNode`), the replacement is refused.
 
 ---
 

@@ -274,7 +274,14 @@ final class Eval {
 		if (ret == null) {
 			return false;
 		}
-		return isIntegral(ret) || (ret.isObject() && "java.lang.String".equals(ret.getObject()));
+		if (isIntegral(ret) || (ret.isObject() && "java.lang.String".equals(ret.getObject()))) {
+			return true;
+		}
+		// byte[]/char[]-returning pure helpers (hex/base64 decoders, key derivers, ...): the interpreter
+		// already produces and unboxes these arrays, so snapshotting them lets a constant-arg call fold
+		// (and the byte[]-as-string comment surface its text form). Other array element types are left
+		// out — they are rarely the carrier of a decoded string.
+		return ret.isArray() && (ArgType.BYTE.equals(ret.getArrayElement()) || ArgType.CHAR.equals(ret.getArrayElement()));
 	}
 
 	private static @Nullable MethodBody snapshotBody(MethodNode mth) {

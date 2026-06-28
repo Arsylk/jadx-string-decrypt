@@ -74,7 +74,11 @@ public final class MethodReflHandler implements JdkClassHandler {
 	private Object safeInvoke(Method m, Object[] args) {
 		String declClass = m.getDeclaringClass().getName();
 		JdkClassHandler h = interpreter.getHandler(declClass);
-		if (!(h instanceof ReflectiveJdkHandler) || !((ReflectiveJdkHandler) h).isAllowed(m.getName())) {
+		boolean allowed = (h instanceof ReflectiveJdkHandler && ((ReflectiveJdkHandler) h).isAllowed(m.getName()))
+				// pure Class member lookups (getMethod/getField/getConstructor): the obfuscator obtains a
+				// handle through a reflective getMethod, so resolving it needs to run that lookup on the host.
+				|| (h instanceof ClassHandler && ((ClassHandler) h).isReflectiveLookupAllowed(m.getName()));
+		if (!allowed) {
 			// Either declaring class is unhandled (user app code) or this method is not allow-listed
 			// (e.g. String.intern()). Refuse so the reflective call stays in source.
 			return null;

@@ -29,13 +29,35 @@ decryption is discarded by a printable-result check.
    - Scans the whole program for **runtime-mutated** statics (SPUT/APUT outside the declaring
      `<clinit>`); reads of those are never folded (soundness gate).
    - Auto-detects string decryptors (`static String x(byte[])` that calls `Cipher.doFinal`).
+   - Note: a self-contained JCE-cipher decryptor (`static String dec(String)` built only from
+     `Base64.decode` + `Cipher`/`SecretKeySpec`/`IvParameterSpec` + `new String(...)`, e.g. a
+     DESede or AES helper) is **not** handled by this AES-only detector — it is folded by the
+     general pure-helper interpreter instead (see below), so no per-app key/algorithm config.
 2. **Decompile pass (`StringDecryptPass`)** — per method:
    - Folds every compile-time-constant numeric/boolean expression to its literal (the headline
      generic feature), including constants reachable only through pure helper calls.
    - Replaces representable constant helper results with typed jadx IR for strings, scalars,
      primitive/object arrays (including `char[]`), and resolved `Class<?>` constants.
+   - Interprets pure helper bodies end-to-end through a JDK whitelist (`jdk/JdkInterpreter` +
+     `JdkClassHandler`s). Besides the stdlib (`String`/`StringBuilder`/`BigInteger`/`Math`/`Arrays`/
+     `Charset`/…) this whitelist covers **`javax.crypto.Cipher` + `SecretKeySpec`/`IvParameterSpec`/
+     `GCMParameterSpec`** and **Base64** (`android.util.Base64`, re-implemented since it is not on the
+     host JDK; and `java.util.Base64` + its `Decoder`/`Encoder`, reflected). So a `static String
+     dec(String)` whose body is `Base64.decode → new SecretKeySpec → Cipher.getInstance/init/doFinal →
+     new String(...)` runs on real host JCE objects driven by its own constants, and every
+     constant-argument call site inlines to plaintext — config-free, any algorithm/key the host
+     supports. Soundness: only `DECRYPT_MODE`/`UNWRAP_MODE` `Cipher.init` is honoured (encrypt/wrap may
+     draw a random IV → non-deterministic); the transformation must be a symmetric cipher; any failure
+     (unsupported transform, bad padding, wrong key) throws and the call is simply left un-folded.
    - Decrypts resolvable string-decryptor calls whose `byte[]` argument is constant.
+   - Rewrites resolvable reflective calls (`handle.invoke(...)`) to the direct call (de-indirection)
+     and sweeps the dead reflective scaffolding it leaves behind.
    - Removes the now-dead feeder instructions (table reads, byte-array build, folded arithmetic).
+
+   Replacement strategies live behind a `Resolver` pipeline (the first non-null wins): built-in
+   decrypt → fold-const → fold-pure-string → de-indirection → **user `.jadx.kts` script pipelines
+   (last)**. The single value→IR boundary is `ReplacementFactory`. Add capabilities as new `Resolver`s,
+   not branches in `tryReplace`.
 
 ## Settings (all prefixed `string-decrypt.`)
 
@@ -45,6 +67,9 @@ decryption is discarded by a printable-result check.
 | `fold-consts` | `true` | fold constant numeric/boolean expressions to literals |
 | `fold-helper-calls` | `true` | also fold pure interpretable helper-method calls (interprocedural) |
 | `decrypt-strings` | `true` | decrypt resolvable block-cipher string-decryptor calls |
+| `deindirect-reflection` | `true` | rewrite resolvable reflective calls to direct calls |
+| `cleanup-reflection` | `true` | remove dead reflective scaffolding (`X.class.getMethod(...).setAccessible` no-ops) |
+| `script-pipelines` | `true` | run user-registered `.jadx.kts` replacement pipelines |
 | `cleanup` | `true` | remove dead feeder instructions |
 | `comments` | `true` | add a method comment listing decrypted strings |
 | `decryptor-class` | `""` | restrict the decryptor to this raw class name; empty = auto-detect only |
@@ -92,6 +117,13 @@ For a folding-only run (skip the string-decryption path):
 
 ## Invariants to preserve when editing
 
+The pass interprets adversarial obfuscated code, so it must **never abort a class's decompile**: each
+per-instruction fold in `StringDecryptPass.visit` is wrapped so an unforeseen evaluator failure is
+logged and skipped, not propagated (a thrown pass = the class drops to an error stub). `ObjectEvaluator`
+also defends its boundaries — refuse (return null), never throw, on type mismatches (array element /
+`ArrayStoreException`), non-integral-primitive arrays (`float[]`/`double[]`), and un-parseable
+`Class.forName` names. Individual decrypted values log at `DEBUG`; the per-method count stays at `INFO`.
+
 On a known obfuscated sample, a correct build keeps:
 - decompile **error count unchanged** vs. plugin-disabled baseline (folding must not break methods);
 - **decrypted-string count stable** (the soundness gate must not over-exclude tables);
@@ -101,3 +133,35 @@ On a known obfuscated sample, a correct build keeps:
 Known deliberate non-fold: a constant inside a jadx `(intExpr) == true ? :` ternary-condition
 artifact is left unfolded — folding it requires mutating jadx's synthetic condition node, which
 introduces decompile errors. Do **not** "fix" this by mutating ternary conditions.
+
+Script pipelines (`PIPELINE_SCRIPTING_PLAN.md`): keep them **last** in the resolver list (the user
+directive — built-in deobfuscation is automatic and primary; pipelines operate on the already-resolved
+values). `StringDecryptPlugin` holds a **live** `PipelineRegistry` reference handed to the pass, so a
+script may register before or after `init`. With no pipelines registered, output must be
+**byte-identical** to before — the resolver returns null immediately. Test gotcha:
+`JadxDecompiler.registerPlugin` is discarded by `load()`; register on jadx's own loaded instance
+(`getPluginManager().getResolvedPluginContexts()`) after `load()`, before the lazy `getCode()`.
+
+Two registration fronts, by how the plugin is loaded:
+
+- **Bundled in-tree** — the typed API (`pipeline(name, id|matcher, ScriptPipeline)` →
+  `PipelineFrame`/`PipelineValue`/`PipelineResult`). Requires the plugin's classes on the script compile
+  classpath, which only holds when bundled.
+- **Installed jar (standalone)** — jadx loads the plugin in a private `URLClassLoader`
+  (`JadxExternalPluginsLoader`), absent from the script's `dependenciesFromCurrentContext` classpath, so a
+  script can't reference plugin types and `@DependsOn` would dual-load incompatible copies. The
+  classloader-safe bridge (`ScriptBridge` + `StringDecryptPlugin.registerPipeline(name, id|Predicate,
+  Function<Map,Object>)`) crosses the split with **shared types only** (JDK `Function`/`Predicate`/`Map`
+  + jadx-core `ArgType`/`InsnNode`); the plugin builds the frame `Map` and interprets the returned value
+  into a `PipelineResult` plugin-side. A script invokes it reflectively (`plugin.javaClass.getMethod
+  ("registerPipeline", …)`), so nothing it touches is loaded by the plugin's classloader. **Do not modify
+  `jadx-script`** — the bridge is what makes standalone work without it. Both fronts feed the same
+  `PipelineRegistry`/`ScriptPipelineResolver`/`ReplacementFactory` engine; keep it one engine.
+
+jadx-gui integration (`StringDecryptGuiActions`, registered in `init` only when `context.getGuiContext()
+!= null` — null on the CLI): a code-area popup action **“Copy as string-decrypt pipeline”** that copies a
+paste-ready `.jadx.kts` skeleton for the clicked node (`ICodeNodeRef` → `MethodNode`/`ClassNode`/
+`FieldNode` → raw id via `getMethodInfo()/getFieldInfo().getRawFullId()` / `getRawName()`). It emits the
+**standalone-bridge** form (reflective `registerPipeline`) so the copied snippet runs against an installed
+jar — the GUI user's actual deployment. `JadxGuiContext`/`ICodeNodeRef` are jadx-core types, so no
+jadx-gui dependency is added (still `compileOnly` jadx-core).

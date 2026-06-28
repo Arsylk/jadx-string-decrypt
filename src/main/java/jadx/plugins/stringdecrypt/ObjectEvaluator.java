@@ -204,13 +204,20 @@ final class ObjectEvaluator {
 		if (javaEl == null) {
 			javaEl = Object.class;
 		}
+		if (javaEl.isPrimitive()) {
+			// Non-integral primitive element reaches here only for float/double (integral arrays are
+			// handled above). We don't model floating-point constant arrays: reflecting one yields a
+			// float[]/double[] that neither casts to Object[] (ClassCastException) nor accepts boxed
+			// values (ArrayStoreException). Refuse to fold rather than crash the pass.
+			return null;
+		}
 		if (assignInsn instanceof FilledNewArrayNode) {
 			FilledNewArrayNode fa = (FilledNewArrayNode) assignInsn;
 			int n = fa.getArgsCount();
 			Object[] out = (Object[]) java.lang.reflect.Array.newInstance(javaEl, n);
 			for (int i = 0; i < n; i++) {
 				Object v = evalArrayElement(fa.getArg(i), depth + 1);
-				if (v == UNRESOLVED_ARRAY_ELEMENT) {
+				if (v == UNRESOLVED_ARRAY_ELEMENT || !storable(javaEl, v)) {
 					return null;
 				}
 				out[i] = v;
@@ -239,7 +246,7 @@ final class ObjectEvaluator {
 							return null;
 						}
 						Object v = evalArrayElement(insn.getArg(2), depth + 1);
-						if (v == UNRESOLVED_ARRAY_ELEMENT) {
+						if (v == UNRESOLVED_ARRAY_ELEMENT || !storable(javaEl, v)) {
 							return null;
 						}
 						out[i] = v;
@@ -249,6 +256,16 @@ final class ObjectEvaluator {
 			return out;
 		}
 		return null;
+	}
+
+	/**
+	 * True iff {@code v} can be stored into an array with component type {@code elemType} without an
+	 * {@link ArrayStoreException}. A {@code null} is always storable into an object array; otherwise the
+	 * value must be an instance of the element type (e.g. a resolved {@code Long} must not be written
+	 * into a {@code String[]} — a type mismatch in the reconstructed array means we refuse the fold).
+	 */
+	private static boolean storable(Class<?> elemType, Object v) {
+		return v == null || elemType.isInstance(v);
 	}
 
 	private static final Object UNRESOLVED_ARRAY_ELEMENT = new Object();
@@ -280,10 +297,19 @@ final class ObjectEvaluator {
 		while (base.isArray()) {
 			base = base.getComponentType();
 		}
-		if (base.isPrimitive() || jdk.handles(base.getName())) {
+		// A primitive, a modelled JDK type, or any standard JDK API class. The last lets a bare
+		// `java.math.MathContext.class` resolve to its live Class so reflective getMethod/getField
+		// lookups that take it as a parameter type can be folded. Sound: handing back a Class constant
+		// only widens what can be *read*; reflective *invocation* on an unmodelled class is still
+		// refused by MethodReflHandler. App `.class` literals (no handler, non-JDK package) stay un-folded.
+		if (base.isPrimitive() || jdk.handles(base.getName()) || isStandardJdkClass(base.getName())) {
 			return c;
 		}
 		return null;
+	}
+
+	private static boolean isStandardJdkClass(String name) {
+		return name.startsWith("java.") || name.startsWith("javax.");
 	}
 
 	/**
@@ -449,10 +475,16 @@ final class ObjectEvaluator {
 		// JDK Class.forName refused the name (not a whitelisted JDK class): if it names a class jadx
 		// loaded from the app, hand back a symbolic ref so the chain above can continue.
 		if (result == null && isStatic && "forName".equals(name) && "java.lang.Class".equals(declClass)
-				&& args.length >= 1 && args[0] instanceof String) {
-			ClassNode node = mth.root().resolveClass((String) args[0]);
-			if (node != null) {
-				return new AppClassRef(node);
+				&& args.length >= 1 && args[0] instanceof String && !((String) args[0]).isEmpty()) {
+			try {
+				ClassNode node = mth.root().resolveClass((String) args[0]);
+				if (node != null) {
+					return new AppClassRef(node);
+				}
+			} catch (RuntimeException e) {
+				// a name that decrypted to something un-parseable (empty/garbage) makes ClassInfo.fromName
+				// throw (e.g. StringIndexOutOfBounds in cleanObjectName) — treat as un-resolvable, don't fold
+				return null;
 			}
 		}
 		return result;

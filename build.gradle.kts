@@ -8,7 +8,7 @@ plugins {
 
 // Independent plugin version — keep in sync with StringDecryptPlugin.VERSION (see AGENT.md).
 group = "io.github.arsylk"
-version = "1.5.1"
+version = "1.12.0"
 description = "jadx plugin: compile-time constant deobfuscator + resolvable block-cipher string decryption"
 
 repositories {

@@ -10,13 +10,17 @@ import org.slf4j.LoggerFactory;
 import jadx.api.plugins.pass.JadxPassInfo;
 import jadx.api.plugins.pass.impl.OrderedJadxPassInfo;
 import jadx.api.plugins.pass.types.JadxDecompilePass;
+import jadx.api.data.CommentStyle;
+import jadx.core.codegen.utils.CodeComment;
 import jadx.core.dex.attributes.AType;
 import jadx.core.dex.info.MethodInfo;
 import jadx.core.dex.instructions.BaseInvokeNode;
+import jadx.core.dex.instructions.ConstClassNode;
 import jadx.core.dex.instructions.ConstStringNode;
 import jadx.core.dex.instructions.IndexInsnNode;
 import jadx.core.dex.instructions.InsnType;
 import jadx.core.dex.instructions.InvokeNode;
+import jadx.core.dex.instructions.InvokeType;
 import jadx.core.dex.instructions.args.ArgType;
 import jadx.core.dex.instructions.args.InsnArg;
 import jadx.core.dex.instructions.args.InsnWrapArg;
@@ -49,7 +53,7 @@ public class StringDecryptPass implements JadxDecompilePass {
 	/** Ordered replacement strategies; the first to return non-null wins (see {@link Resolver}). */
 	private final List<Resolver> resolvers;
 
-	public StringDecryptPass(StringDecryptOptions options, KeyData keys) {
+	public StringDecryptPass(StringDecryptOptions options, KeyData keys, PipelineRegistry pipelines) {
 		this.options = options;
 		this.keys = keys;
 		this.jdk = new JdkInterpreter();
@@ -66,14 +70,19 @@ public class StringDecryptPass implements JadxDecompilePass {
 		}
 		this.pureFold = new PureFold(keys, jdk);
 		// The replacement pipeline, in priority order. Each prong keeps its original option gate, so the
-		// behaviour is identical to the former hand-rolled if-chain; future strategies (reflective
-		// de-indirection, script pipelines) are inserted here rather than edited into tryReplace.
+		// behaviour is identical to the former hand-rolled if-chain; future strategies are inserted here
+		// rather than edited into tryReplace.
 		this.resolvers = List.of(
 				ctx -> options.isDecryptStrings() ? tryDecrypt(ctx.mth, ctx.ev, ctx.insn, ctx.decrypted, ctx.builtArrays) : null,
 				ctx -> options.isFoldHelperCalls() ? tryFoldConstValue(ctx.oev, ctx.insn, ctx.decrypted, ctx.consumerIsLookup) : null,
 				ctx -> options.isFoldHelperCalls() ? tryFoldPureString(ctx.mth, ctx.ev, ctx.insn, ctx.decrypted) : null,
-				// Runs last: only reflective calls the folders left un-constant get rewritten to direct calls.
-				new DeindirectionResolver(options));
+				// Reflective calls the folders left un-constant get rewritten to direct calls.
+				new DeindirectionResolver(options),
+				// Runs last: the built-in decryption/folding/de-indirection happen automatically first, so a
+				// user .jadx.kts pipeline operates on the already-resolved values and handles the
+				// app-specific calls the built-ins declined (its frame args are already decrypted/folded
+				// because wrapped producers are resolved inner-first).
+				new ScriptPipelineResolver(options, pipelines));
 	}
 
 	@Override
@@ -105,33 +114,68 @@ public class StringDecryptPass implements JadxDecompilePass {
 		List<RegisterArg> builtArrays = new ArrayList<>();
 		for (BlockNode block : mth.getBasicBlocks()) {
 			for (InsnNode insn : block.getInstructions()) {
-				replaceWrapped(mth, ev, oev, insn, decrypted, builtArrays);
+				// Per-instruction safety net: this pass interprets adversarial obfuscated code, so an
+				// unforeseen edge case in one instruction must never abort the whole class's decompile
+				// (which would drop it to an error stub). A throw here means no modification was applied
+				// to this insn — IR stays consistent — so we log and move on.
+				try {
+					replaceWrapped(mth, ev, oev, insn, decrypted, builtArrays);
+				} catch (RuntimeException e) {
+					LOG.warn("string-decrypt: skipped a wrapped fold in {} ({})", mth, e.toString());
+				}
 			}
 			for (InsnNode insn : new ArrayList<>(block.getInstructions())) {
-				InsnNode repl = tryReplace(mth, ev, oev, insn, decrypted, builtArrays, false);
-				if (repl != null) {
-					BlockUtils.replaceInsn(mth, block, insn, repl);
+				try {
+					InsnNode repl = tryReplace(mth, ev, oev, insn, decrypted, builtArrays, false);
+					if (repl != null) {
+						BlockUtils.replaceInsn(mth, block, insn, repl);
+					}
+				} catch (RuntimeException e) {
+					LOG.warn("string-decrypt: skipped a fold in {} ({})", mth, e.toString());
 				}
 			}
 		}
-		int folded = options.isFoldConsts() ? foldIntConstants(mth, ev) : 0;
+		int folded = options.isFoldConsts() ? safeFoldIntConstants(mth, ev) : 0;
 		if (options.isCleanup()) {
-			for (RegisterArg arrArg : builtArrays) {
-				cleanupArrayBuild(mth, arrArg);
-			}
-			removeDeadPureInsns(mth); // drop now-unused table reads / folded-away arithmetic
-			if (options.isCleanupOrphanArrays()) {
-				removeDeadArrayBuilds(mth); // sweep orphan `new byte[]{...}[N] = X` statements after folds
+			try {
+				for (RegisterArg arrArg : builtArrays) {
+					cleanupArrayBuild(mth, arrArg);
+				}
+				removeDeadPureInsns(mth); // drop now-unused table reads / folded-away arithmetic
+				if (options.isCleanupOrphanArrays()) {
+					removeDeadArrayBuilds(mth); // sweep orphan `new byte[]{...}[N] = X` statements after folds
+				}
+				if (options.isDeindirectReflection() && options.isCleanupReflection()) {
+					removeDeadReflectiveScaffold(mth, oev); // sweep no-op reflective lookups left after de-indirection
+				}
+			} catch (RuntimeException e) {
+				LOG.warn("string-decrypt: cleanup skipped in {} ({})", mth, e.toString());
 			}
 		}
 		if (!decrypted.isEmpty()) {
+			// Per-class/method count stays at INFO; the individual decrypted results are logged at DEBUG.
 			LOG.info("string-decrypt: {} string(s) in {}", decrypted.size(), mth);
+			if (LOG.isDebugEnabled()) {
+				for (String s : decrypted) {
+					LOG.debug("string-decrypt:   decrypted {} in {}", s, mth);
+				}
+			}
 			if (options.isComments()) {
 				mth.addInfoComment("String decrypt: " + summarizeDecrypted(decrypted));
 			}
 		}
 		if (folded > 0) {
 			LOG.debug("string-decrypt: folded {} integer constant(s) in {}", folded, mth);
+		}
+	}
+
+	/** {@link #foldIntConstants} guarded so an unexpected evaluator failure can't abort the class. */
+	private int safeFoldIntConstants(MethodNode mth, Evaluator ev) {
+		try {
+			return foldIntConstants(mth, ev);
+		} catch (RuntimeException e) {
+			LOG.warn("string-decrypt: integer-const folding skipped in {} ({})", mth, e.toString());
+			return 0;
 		}
 	}
 
@@ -314,6 +358,133 @@ public class StringDecryptPass implements JadxDecompilePass {
 	}
 
 	/**
+	 * After de-indirection rewrites the reflective calls to direct ones, the obfuscator's reflective
+	 * <i>scaffolding</i> is left behind as dead no-ops: statements of the form
+	 * {@code SomeClass.class.getMethod("m", types).setAccessible(true);} (look a member up and discard
+	 * it), and {@code Method m = SomeClass.class.getMethod(...)} handle definitions whose only consumer
+	 * (the reflective invoke) is now gone. This sweeps them, iterated to a fixpoint.
+	 *
+	 * <p>
+	 * <b>Soundness — only provably-no-op statements are removed:</b>
+	 * <ul>
+	 * <li>The lookup chain must be rooted at a {@code .class} literal ({@link ConstClassNode}), never
+	 * {@code Class.forName(...)} — a class literal does not trigger class initialization, so the lookup
+	 * has no side effect, whereas {@code forName} can run a static initializer.</li>
+	 * <li>Only the pure member-lookup methods ({@code getMethod}/{@code getField}/{@code getConstructor}
+	 * and {@code -Declared} variants) are folded away.</li>
+	 * <li>The lookup is re-resolved through the {@link ObjectEvaluator}; removal happens only when it
+	 * resolves to a real member, which proves it cannot throw {@code NoSuchMethodException} at runtime.</li>
+	 * <li>Reflective {@code Method.invoke(...)} calls are <b>never</b> touched: they are the only
+	 * statements that can throw {@code InvocationTargetException}, and removing one could leave a
+	 * {@code catch (InvocationTargetException)} with no corresponding thrower.</li>
+	 * <li>A {@code setAccessible} is removed only when its target is the inlined throwaway lookup (the
+	 * handle is discarded); a {@code setAccessible} on a stored handle that is still used elsewhere is
+	 * kept, since that handle's accessibility may matter for a surviving reflective use.</li>
+	 * </ul>
+	 */
+	private void removeDeadReflectiveScaffold(MethodNode mth, ObjectEvaluator oev) {
+		boolean removedAny = true;
+		while (removedAny) {
+			removedAny = false;
+			List<InsnNode> dead = new ArrayList<>();
+			for (BlockNode block : mth.getBasicBlocks()) {
+				for (InsnNode insn : block.getInstructions()) {
+					collectDeadLookupCluster(insn, oev, dead);
+				}
+			}
+			if (!dead.isEmpty()) {
+				InsnRemover.removeAllAndUnbind(mth, dead);
+				removedAny = true;
+			}
+		}
+	}
+
+	/**
+	 * If {@code insn} is a pure class-literal member lookup ({@code X.class.getMethod(...)}) whose result
+	 * is consumed only by no-op {@code setAccessible} calls (or by nothing at all), add the lookup and
+	 * those {@code setAccessible} statements to {@code dead}. The pass runs before code-shrink inlines
+	 * the lookup into its consumer, so the lookup is still a distinct instruction with the
+	 * {@code setAccessible} as a SSA use. See {@link #removeDeadReflectiveScaffold} for the soundness
+	 * argument; the key gates are: the lookup re-resolves (proves no {@code NoSuchMethodException}); no
+	 * consumer is a reflective {@code Method.invoke} (those can throw {@code InvocationTargetException}
+	 * and are never touched).
+	 */
+	private static void collectDeadLookupCluster(InsnNode insn, ObjectEvaluator oev, List<InsnNode> dead) {
+		if (!isPureClassLiteralLookup(insn) || oev.evalProducerDirect(insn, 0) == null) {
+			return;
+		}
+		RegisterArg result = insn.getResult();
+		SSAVar sVar = result != null ? result.getSVar() : null;
+		if (sVar == null) {
+			return;
+		}
+		List<InsnNode> consumers = new ArrayList<>();
+		for (RegisterArg use : sVar.getUseList()) {
+			InsnNode p = use.getParentInsn();
+			// the handle must flow only into the receiver slot of a void, direct setAccessible call
+			if (p == null || !isDirectSetAccessible(p) || use != p.getArg(0) || hasLiveResult(p)) {
+				return; // any other consumer (e.g. a surviving reflective invoke) -> keep the whole cluster
+			}
+			consumers.add(p);
+		}
+		dead.add(insn);
+		dead.addAll(consumers); // empty when the lookup result is already fully unused
+	}
+
+	/** True iff {@code insn} is a direct (non-reflective) {@code handle.setAccessible(bool)} call. */
+	private static boolean isDirectSetAccessible(InsnNode insn) {
+		if (!(insn instanceof InvokeNode)) {
+			return false;
+		}
+		InvokeNode inv = (InvokeNode) insn;
+		return inv.getInvokeType() != InvokeType.STATIC && "setAccessible".equals(inv.getCallMth().getName());
+	}
+
+	/** True iff {@code insn}'s result SSA var has at least one remaining use. */
+	private static boolean hasLiveResult(InsnNode insn) {
+		RegisterArg result = insn.getResult();
+		SSAVar sVar = result != null ? result.getSVar() : null;
+		return sVar != null && !sVar.getUseList().isEmpty();
+	}
+
+	/**
+	 * True iff {@code insn} is {@code SomeClass.class.getMethod/getField/getConstructor(...)} (or a
+	 * {@code -Declared} variant) — a pure, side-effect-free reflective member lookup rooted at a class
+	 * literal (so no {@code Class.forName} class-initialization side effect).
+	 */
+	private static boolean isPureClassLiteralLookup(InsnNode insn) {
+		if (!(insn instanceof InvokeNode)) {
+			return false;
+		}
+		InvokeNode inv = (InvokeNode) insn;
+		if (!"java.lang.Class".equals(inv.getCallMth().getDeclClass().getFullName())) {
+			return false;
+		}
+		switch (inv.getCallMth().getName()) {
+			case "getMethod":
+			case "getDeclaredMethod":
+			case "getField":
+			case "getDeclaredField":
+			case "getConstructor":
+			case "getDeclaredConstructor":
+				break;
+			default:
+				return false;
+		}
+		InsnArg clsArg = inv.getInstanceArg();
+		if (clsArg == null) {
+			return false;
+		}
+		if (clsArg.isInsnWrap()) {
+			return ((InsnWrapArg) clsArg).getWrapInsn() instanceof ConstClassNode;
+		}
+		if (clsArg instanceof RegisterArg) {
+			return ((RegisterArg) clsArg).getAssignInsn() instanceof ConstClassNode;
+		}
+		return false;
+	}
+
+	/**
 	 * Cap the "String decrypt: …" comment at a few unique entries so heavily-obfuscated methods
 	 * (hundreds of folded strings) don't produce wall-of-text comments that drown out the actual
 	 * code. The full list lives in the debug log; the comment is for quick orientation.
@@ -367,7 +538,20 @@ public class StringDecryptPass implements JadxDecompilePass {
 				InsnNode repl = tryReplace(mth, ev, oev, wrapInsn, decrypted, builtArrays, outerIsLookup);
 				if (repl != null) {
 					InsnRemover.unbindArgUsage(mth, arg);
+					// A wrapped (inlined) value flows through the wrap, not a result register: the consumer
+					// owns it. Drop any result the resolver copied from the original insn so the following
+					// rebind doesn't re-point that SSA var's assignment onto a node that has no slot in the
+					// block. (`ReplacementFactory.copyReplacementMetadata` sets a result for the top-level
+					// install path; here it must not survive.)
+					repl.setResult(null);
 					insn.setArg(i, InsnArg.wrapInsnIntoArg(repl));
+					// Bind the replacement's register args into their SSAVar use-lists — the symmetric step
+					// to BlockUtils.replaceInsn's rebindArgs() on the top-level path. Without this a
+					// replacement carrying RegisterArgs (e.g. the de-indirected direct call synthesized by
+					// DeindirectionResolver) leaves stale use-lists, corrupting later type inference.
+					// Recurses into nested InsnWrapArgs, so a boxed call (Integer.valueOf(parseInt(s))) binds
+					// fully in one pass. Harmless for the const folders, whose nodes carry no register args.
+					repl.rebindArgs();
 				}
 			}
 		}
@@ -426,7 +610,35 @@ public class StringDecryptPass implements JadxDecompilePass {
 		}
 		boolean suppressLookup = options.isSuppressDecoyLookups()
 				&& (consumerIsLookup || isConsumedByReflectiveNameLookup(insn));
-		return ReplacementFactory.makeReplacementInsn(insn, folded, targetType, decrypted, suppressLookup);
+		InsnNode repl = ReplacementFactory.makeReplacementInsn(insn, folded, targetType, decrypted, suppressLookup);
+		if (repl != null && folded instanceof byte[] && options.isComments()) {
+			// A folded byte[] (a decoded key, a decryptor's intermediate, ...) renders as an opaque
+			// `new byte[]{...}` literal; when those bytes are printable text, surface the string form so
+			// the meaning is visible without decoding the bytes by hand.
+			annotateBytesAsString(repl, (byte[]) folded, decrypted);
+		}
+		return repl;
+	}
+
+	/**
+	 * Surface the string form of a folded {@code byte[]} when its bytes decode to printable UTF-8 text.
+	 * Adds an inline {@code as string: "…"} comment on the folded node (renders when the fold is a
+	 * statement-level {@code byte[] x = …}) and records it in {@code decrypted} so it always appears in
+	 * the method's "String decrypt:" summary comment and the DEBUG log — even when the byte[] is an
+	 * inlined sub-expression (a {@code return}/argument) where an instruction comment wouldn't render.
+	 * Nothing is added for binary (non-text) byte arrays, where a string form would be noise.
+	 */
+	private static void annotateBytesAsString(InsnNode node, byte[] bytes, List<String> decrypted) {
+		if (bytes.length == 0) {
+			return;
+		}
+		String text = new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
+		if (!Eval.isPrintable(text)) {
+			return;
+		}
+		String escaped = text.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r");
+		node.addAttr(AType.CODE_COMMENTS, new CodeComment("as string: \"" + escaped + "\"", CommentStyle.BLOCK_CONDENSED));
+		decrypted.add("byte[] \"" + escaped + "\"");
 	}
 
 	/**
@@ -592,7 +804,7 @@ public class StringDecryptPass implements JadxDecompilePass {
 			return null;
 		}
 		String text = (String) folded;
-		LOG.debug("fold {} -> \"{}\" in {}", inv.getCallMth().getShortId(), text, mth);
+		// each decrypted value is logged centrally at DEBUG in visit(); just record it here
 		decrypted.add('"' + text.replace("\\", "\\\\").replace("\"", "\\\"") + '"');
 		ConstStringNode node = new ConstStringNode(text);
 		RegisterArg result = insn.getResult();
@@ -628,7 +840,6 @@ public class StringDecryptPass implements JadxDecompilePass {
 		if (text == null || !Eval.isPrintable(text)) {
 			return null;
 		}
-		LOG.debug("decrypt({} bytes) -> \"{}\" in {}", bytes.length, text, mth);
 		decrypted.add('"' + text.replace("\\", "\\\\").replace("\"", "\\\"") + '"');
 		if (blobArg instanceof RegisterArg) {
 			builtArrays.add((RegisterArg) blobArg); // remember the array var to clean up afterwards

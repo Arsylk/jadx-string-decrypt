@@ -8,6 +8,8 @@ import org.jetbrains.annotations.Nullable;
 import jadx.core.dex.info.ClassInfo;
 import jadx.core.dex.info.MethodInfo;
 import jadx.core.dex.instructions.FilledNewArrayNode;
+import jadx.core.dex.instructions.IndexInsnNode;
+import jadx.core.dex.instructions.InsnType;
 import jadx.core.dex.instructions.InvokeNode;
 import jadx.core.dex.instructions.InvokeType;
 import jadx.core.dex.instructions.args.ArgType;
@@ -30,19 +32,24 @@ import jadx.core.dex.nodes.RootNode;
  * <li><b>meta-peel</b>: when the resolved handle is {@code Method.invoke} itself, the call is the
  * obfuscator's {@code Method.class.getMethod("invoke").invoke(realHandle, recv, args)} form — peel one
  * layer and recurse on {@code realHandle};</li>
- * <li><b>direct</b>: build the real call. <b>Static</b> targets only for now (a virtual call would
- * need the receiver re-typed to the declaring class, which the reflective context does not guarantee).
- * A primitive return is re-boxed with {@code Boxed.valueOf(...)} to keep the {@code Object}-typed
- * reflective context's expectations; args are reference-typed (used unchanged) or {@code
- * Boxed.valueOf(prim)} unboxed to {@code prim}.</li>
+ * <li><b>direct</b>: build the real call — {@code STATIC} or {@code VIRTUAL}. For an instance target
+ * the {@code Object}-typed reflective receiver is re-typed to the declaring class (a {@code CHECK_CAST}
+ * is inserted only when its static type isn't already assignable; sound because the runtime object
+ * provably is that type). A primitive return is re-boxed with {@code Boxed.valueOf(...)} to keep the
+ * {@code Object}-typed reflective context's expectations; primitive args are unwrapped from their
+ * {@code Boxed.valueOf(prim)}/literal form, reference args flow through (cast to the parameter type
+ * when needed).</li>
  * </ul>
  * Anything it cannot prove safe is declined, leaving the existing (already string-folded) form.
  *
  * <p>
- * <b>EXPERIMENTAL — off by default.</b> The current argument duplication ({@link #dup}) is not yet
- * SSA-correct: re-using/copying a runtime register into the synthesized call perturbs jadx's later
- * type inference (e.g. an unrelated {@code Long.valueOf(i)} can render as {@code Long.valueOf((Object)
- * i)}). Re-enable only after the arg moves go through proper SSA use-list rebinding.
+ * The arguments duplicated into the synthesized call ({@link #dup}) carry their {@link
+ * jadx.core.dex.instructions.args.SSAVar}s but are bound into the use-lists only when the install
+ * site calls {@code rebindArgs()} — for the wrapped (inlined) path this happens in {@code
+ * StringDecryptPass.replaceWrapped}, mirroring {@code BlockUtils.replaceInsn} on the top-level path.
+ * Skipping that rebind perturbs jadx's later type inference (an unrelated {@code Long.valueOf(i)}
+ * rendering as {@code Long.valueOf((Object) i)}), which is why this resolver must never install a
+ * register-bearing replacement without it.
  */
 final class DeindirectionResolver implements Resolver {
 
@@ -94,16 +101,13 @@ final class DeindirectionResolver implements Resolver {
 			}
 			return deindirect(ctx, receiverArg, meta.get(0), meta.get(1), metaInsn, guard - 1);
 		}
-		if (!target.isStatic) {
-			return null; // static targets only (no receiver re-typing yet)
-		}
 		List<InsnArg> elems = arrayElements(argsArray);
 		if (elems == null || elems.size() != target.params.size()) {
 			return null;
 		}
 		List<InsnArg> callArgs = new ArrayList<>(elems.size());
 		for (int i = 0; i < elems.size(); i++) {
-			InsnArg mapped = mapArg(elems.get(i), target.params.get(i));
+			InsnArg mapped = mapArg(ctx, elems.get(i), target.params.get(i));
 			if (mapped == null) {
 				return null;
 			}
@@ -111,7 +115,21 @@ final class DeindirectionResolver implements Resolver {
 		}
 		RootNode root = ctx.mth.root();
 		MethodInfo mi = MethodInfo.fromDetails(root, target.declClass, target.name, target.params, target.returnType);
-		InvokeNode direct = new InvokeNode(mi, InvokeType.STATIC, callArgs.size());
+		InvokeNode direct;
+		if (target.isStatic) {
+			direct = new InvokeNode(mi, InvokeType.STATIC, callArgs.size());
+		} else {
+			// Instance call: the reflective receiver is typed Object, so re-type it to the declaring
+			// class. coerceToType inserts a CHECK_CAST only when the static type isn't already the
+			// declaring class (sound: the runtime object provably is that type, else the original
+			// reflective invoke would have thrown). receiver becomes VIRTUAL arg 0.
+			InsnArg recv = coerceToType(ctx, receiverArg, target.declClass.getType());
+			if (recv == null) {
+				return null;
+			}
+			direct = new InvokeNode(mi, InvokeType.VIRTUAL, 1 + callArgs.size());
+			direct.addArg(recv);
+		}
 		for (InsnArg a : callArgs) {
 			direct.addArg(a);
 		}
@@ -165,7 +183,11 @@ final class DeindirectionResolver implements Resolver {
 		return null; // void or unknown -> can't box
 	}
 
-	/** The element args of a {@code new Object[]{...}} produced as a {@code FILLED_NEW_ARRAY}. */
+	/**
+	 * The element args of a reflective {@code Object[]} argument: a {@code FILLED_NEW_ARRAY}
+	 * {@code new Object[]{a, b, …}}, or an empty {@code new Object[0]} ({@code NEW_ARRAY} of constant
+	 * size 0) — the latter is how a no-arg method is invoked reflectively.
+	 */
 	private static @Nullable List<InsnArg> arrayElements(@Nullable InsnArg arrayArg) {
 		if (arrayArg == null) {
 			return null;
@@ -178,24 +200,70 @@ final class DeindirectionResolver implements Resolver {
 		} else {
 			return null;
 		}
-		if (!(prod instanceof FilledNewArrayNode)) {
-			return null;
+		if (prod instanceof FilledNewArrayNode) {
+			FilledNewArrayNode arr = (FilledNewArrayNode) prod;
+			List<InsnArg> out = new ArrayList<>(arr.getArgsCount());
+			for (int i = 0; i < arr.getArgsCount(); i++) {
+				out.add(arr.getArg(i));
+			}
+			return out;
 		}
-		FilledNewArrayNode arr = (FilledNewArrayNode) prod;
-		List<InsnArg> out = new ArrayList<>(arr.getArgsCount());
-		for (int i = 0; i < arr.getArgsCount(); i++) {
-			out.add(arr.getArg(i));
+		if (prod != null && prod.getType() == InsnType.NEW_ARRAY && prod.getArgsCount() >= 1
+				&& prod.getArg(0) instanceof LiteralArg && ((LiteralArg) prod.getArg(0)).getLiteral() == 0L) {
+			return new ArrayList<>(); // no-arg call: new Object[0]
 		}
-		return out;
+		return null;
 	}
 
 	/** Map one reflective {@code Object[]} element to the direct call's argument for {@code param}. */
-	private static @Nullable InsnArg mapArg(InsnArg elem, ArgType param) {
+	private static @Nullable InsnArg mapArg(ResolveContext ctx, InsnArg elem, ArgType param) {
 		if (param.isPrimitive()) {
+			// a) the obfuscator's Boxed.valueOf(prim) wrap -> the underlying primitive
 			InsnArg prim = unwrapValueOf(elem, param);
-			return prim != null ? dup(prim) : null;
+			if (prim != null) {
+				return dup(prim);
+			}
+			// b) a boxed primitive the const folder already collapsed to a literal -> re-emit as `param`
+			if (elem instanceof LiteralArg) {
+				return InsnArg.lit(((LiteralArg) elem).getLiteral(), param);
+			}
+			return null;
 		}
-		return dup(elem); // reference parameter: the element flows through unchanged
+		// reference parameter: the reflective Object[] element is Object-typed, so cast to the param
+		// type when its static type isn't already assignable.
+		return coerceToType(ctx, elem, param);
+	}
+
+	/**
+	 * Duplicate {@code arg} and, if its static type is not already assignable to {@code targetType},
+	 * wrap it in an explicit {@code CHECK_CAST}. The reflective context types every receiver/argument
+	 * as {@code Object}; the resolved target needs the real type. The cast is sound because the
+	 * runtime value provably is that type (the original reflective invoke would have thrown otherwise).
+	 */
+	private static @Nullable InsnArg coerceToType(ResolveContext ctx, InsnArg arg, ArgType targetType) {
+		InsnArg d = dup(arg);
+		if (d == null) {
+			return null;
+		}
+		if (assignableTo(ctx, d.getType(), targetType)) {
+			return d;
+		}
+		InsnNode cast = new IndexInsnNode(InsnType.CHECK_CAST, targetType, 1);
+		cast.addArg(d);
+		InsnArg wrapped = InsnArg.wrapInsnIntoArg(cast);
+		wrapped.setType(targetType);
+		return wrapped;
+	}
+
+	/** True iff a value of static type {@code from} can be used where {@code to} is expected. */
+	private static boolean assignableTo(ResolveContext ctx, @Nullable ArgType from, ArgType to) {
+		if (from == null || !from.isTypeKnown()) {
+			return false;
+		}
+		if (from.equals(to)) {
+			return true;
+		}
+		return ctx.mth.root().getTypeCompare().compareTypes(from, to).isNarrowOrEqual();
 	}
 
 	/** {@code Boxed.valueOf(prim)} → the {@code prim} argument, when it matches the primitive {@code param}. */
@@ -204,20 +272,28 @@ final class DeindirectionResolver implements Resolver {
 			return null;
 		}
 		InsnNode p = ((InsnWrapArg) elem).getWrapInsn();
+		// Peel CHECK_CAST/CAST wrappers: a nested reflective box that we already de-indirected arrives
+		// as `(Boxed) Boxed.valueOf(prim)` (the coerceToType cast around the synthesized valueOf).
+		while ((p.getType() == InsnType.CHECK_CAST || p.getType() == InsnType.CAST)
+				&& p.getArgsCount() == 1 && p.getArg(0).isInsnWrap()) {
+			p = ((InsnWrapArg) p.getArg(0)).getWrapInsn();
+		}
 		if (!(p instanceof InvokeNode)) {
 			return null;
 		}
 		MethodInfo mi = ((InvokeNode) p).getCallMth();
-		if (!"valueOf".equals(mi.getName()) || p.getArgsCount() != 1) {
+		if (!"valueOf".equals(mi.getName()) || p.getArgsCount() != 1 || mi.getArgumentsTypes().size() != 1) {
 			return null;
 		}
-		InsnArg inner = p.getArg(0);
-		return param.equals(inner.getType()) ? inner : null;
+		// Trust the resolved Boxed.valueOf(prim) signature: its single argument is that primitive.
+		// (The wrapped arg's own type can be UNKNOWN when it's a synthesized CAST from a nested
+		// de-indirection, so comparing inner.getType() directly would spuriously fail.)
+		return param.equals(mi.getArgumentsTypes().get(0)) ? p.getArg(0) : null;
 	}
 
 	private static @Nullable InsnArg dup(InsnArg arg) {
 		if (arg instanceof RegisterArg) {
-			return ((RegisterArg) arg).duplicate();
+			return ((RegisterArg) arg).duplicate(); // duplicate() carries reg, SSAVar and type
 		}
 		if (arg.isInsnWrap()) {
 			return InsnArg.wrapInsnIntoArg(((InsnWrapArg) arg).getWrapInsn().copy());

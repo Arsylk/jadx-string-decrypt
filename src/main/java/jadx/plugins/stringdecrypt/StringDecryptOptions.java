@@ -30,7 +30,9 @@ public class StringDecryptOptions extends BasePluginOptionsBuilder {
 	private boolean foldReflectiveBridges = true;
 	private boolean foldObjectReturningInvokes = true;
 	private boolean suppressDecoyLookups = true;
-	private boolean deindirectReflection = false;
+	private boolean deindirectReflection = true;
+	private boolean cleanupReflection = true;
+	private boolean scriptPipelines = true;
 	private String decryptorClass = "";
 	private String decryptorDesc = DEFAULT_DECRYPTOR_DESC;
 	private String cipher = DEFAULT_CIPHER;
@@ -85,9 +87,19 @@ public class StringDecryptOptions extends BasePluginOptionsBuilder {
 				.setter(v -> suppressDecoyLookups = v);
 
 		boolOption(StringDecryptPlugin.PLUGIN_ID + ".deindirect-reflection")
-				.description("Rewrite resolvable reflective calls to direct calls (experimental)")
-				.defaultValue(false)
+				.description("Rewrite resolvable reflective calls to direct calls")
+				.defaultValue(true)
 				.setter(v -> deindirectReflection = v);
+
+		boolOption(StringDecryptPlugin.PLUGIN_ID + ".cleanup-reflection")
+				.description("Remove dead reflective scaffolding (X.class.getMethod(...).setAccessible no-ops)")
+				.defaultValue(true)
+				.setter(v -> cleanupReflection = v);
+
+		boolOption(StringDecryptPlugin.PLUGIN_ID + ".script-pipelines")
+				.description("Run user-registered .jadx.kts replacement pipelines")
+				.defaultValue(true)
+				.setter(v -> scriptPipelines = v);
 
 		boolOption(StringDecryptPlugin.PLUGIN_ID + ".comments")
 				.description("Add decrypted-strings comment")
@@ -172,6 +184,14 @@ public class StringDecryptOptions extends BasePluginOptionsBuilder {
 
 	public boolean isDeindirectReflection() {
 		return deindirectReflection;
+	}
+
+	public boolean isCleanupReflection() {
+		return cleanupReflection;
+	}
+
+	public boolean isScriptPipelines() {
+		return scriptPipelines;
 	}
 
 	public boolean isComments() {

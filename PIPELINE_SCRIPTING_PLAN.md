@@ -13,6 +13,82 @@ already advertises `1.4.0`, so the actual version bump should follow
 `build.gradle.kts`, `StringDecryptPlugin.VERSION`, generated `BuildInfo`, and
 release tags aligned.
 
+---
+
+## STATUS (v1.10.0 — Phases 1–8 DONE, including the standalone-jar classloader bridge)
+
+Implemented and green (all tests pass, golden unchanged with no pipelines registered):
+- **Phase 1** was already done before this work: the value→IR boundary lives in `ReplacementFactory`
+  (`makeReplacementInsn`/`copyReplacementMetadata`/`isCompatibleReplacementValue`/array+scalar+class
+  helpers). The resolver seam is `Resolver`/`ResolveContext`. No re-extraction needed.
+- **Phase 2** public API: `ScriptPipeline`, `PipelineMatcher` (+`exact/owner/name/returns/descriptor/
+  anyOf/allOf`), `PipelineFrame` (`arg`/`receiver`/`rawArg`/`call`/`rawFullId`/`targetType`/…),
+  `PipelineValue` (memoized; `object`/`string`/`bytes`/`chars`/scalars/arrays/`classValue`/`classType`/
+  raw escape hatches), `PipelineResult` (`Kind` + `keep`/`commentOnly`/`fail`/`replace…` factories +
+  fluent `comment`/`cleanupArg`/`targetType`), `PipelineRegistration`.
+- **Phase 3** registry: package-private `PipelineRegistry` (exact-id `ConcurrentHashMap` fast path +
+  `CopyOnWriteArrayList` predicates + global order); `StringDecryptPlugin.pipeline(name,id,cb)` /
+  `pipeline(name,matcher,cb)` / `clearPipelines` / `getPipelines` / `apiClassLoader`. The pass holds a
+  **live registry reference** (not a snapshot).
+- **Phase 4** wiring: `ScriptPipelineResolver` converts the first `REPLACE` to IR via `ReplacementFactory`
+  (and `ConstClassNode` for `replaceClassType`), applies cleanup to the pass's use-list-validated
+  `builtArrays`, surfaces `comment()`/`note()` in the method summary, and never aborts decompilation on a
+  callback exception (logs + declines). Option `string-decrypt.script-pipelines` (default on). A basic
+  classloader-mismatch diagnostic is in place.
+- **Phase 5** (Kotlin docs): the README "Script pipelines" section and `examples/*.jadx.kts` show the
+  extension-function-free lambda style against `PipelineFrame`/`PipelineResult`; the plugin stays
+  Java-only (no hard `jadx-script` dependency).
+- **Phase 6** (standalone classloader — SOLVED **without** touching `jadx-script`): `ScriptBridge` +
+  `StringDecryptPlugin.registerPipeline(name, id|Predicate, Function<Map,Object>)`. An installed plugin
+  loads in its own `URLClassLoader` (`JadxExternalPluginsLoader`), absent from the script's
+  `dependenciesFromCurrentContext(wholeClasspath)` compile classpath, so a script can't reference plugin
+  types (and `@DependsOn` would dual-load incompatible copies). The bridge crosses the split with **shared
+  types only** (JDK `Function`/`Predicate`/`Map` + jadx-core `ArgType`/`InsnNode`): the plugin builds the
+  frame `Map` and interprets the returned `Object` (`null`=keep; String/boxed/array/`Class`=value;
+  `ArgType`=class literal; `InsnNode`=raw IR; `Map`=structured action) into a `PipelineResult` plugin-side.
+  A script invokes it reflectively, so nothing it touches is loaded by the plugin's classloader. Both
+  fronts feed the same `PipelineRegistry`/`ScriptPipelineResolver`/`ReplacementFactory` engine.
+- **Phase 7** tests (25 total, all green): `PipelineApiTest` (8 contract), `PipelinePassTest` (5 real-APK
+  typed-API end-to-end), `ReplacementMatrixTest` (7: the full value→IR surface), and `StandaloneBridgeTest`
+  (4: reflective shared-type registration replaces end-to-end + frame-map shape, predicate decline,
+  `interpret` return-value contract, `Map`-action contract).
+- **Phase 8** docs: README "Script pipelines" + "Installed-jar (standalone) pipelines" sections, four
+  runnable `examples/*.jadx.kts` (`xor-char-string`, `char-array-result`, `class-result`,
+  `standalone-bridge`), AGENT.md invariants (pipelines last, live registry, byte-identical with none
+  registered, the two registration fronts, the `registerPlugin`/`load()` test gotcha), and the new options
+  in both option tables.
+
+### KEY DEVIATION from this plan (per user direction)
+**Pipelines run LAST, not first.** The plan (§"Pipeline Execution Order") put scripts first so user
+intent overrides built-ins. The user's correct call: the built-in decryption/folding/de-indirection are
+the automatic primary deobfuscation, and pipelines operate *after* — on already-resolved values,
+handling the app-specific calls the built-ins declined. So `ScriptPipelineResolver` is the **last**
+resolver in `StringDecryptPass`. Consequence: a pipeline only sees candidates the built-ins left (their
+frame args are already decrypted/folded because wrapped producers resolve inner-first), and cannot
+override a built-in result at the same candidate. Update §"Pipeline Execution Order In The Pass"
+accordingly.
+
+### Test-harness gotcha (important for any future script test)
+`JadxDecompiler.registerPlugin(p)` is **discarded** by `jadx.load()` (it calls `allPlugins.clear()` then
+re-resolves from the loader/SPI). Register pipelines on jadx's *own* loaded instance, retrieved via
+`jadx.getPluginManager().getResolvedPluginContexts()` → `getPluginInstance()`, **after `load()` but
+before the lazy `getCode()`** — which works precisely because the registry is a live reference. This is
+also the real `.jadx.kts` flow.
+
+### Remaining (not yet done)
+All core phases (1–8) are done, **including the standalone-jar path** (Phase 6) — solved with the
+shared-type `ScriptBridge`/`registerPipeline` reflection bridge rather than the originally-planned
+`jadx-script` changes (appending plugin jars to the compile classpath etc.), since the user constraint was
+to make standalone work **without modifying `jadx-script`**. The typed in-tree API and the standalone
+bridge coexist and share one engine. The legacy mismatch diagnostic
+(`ScriptPipelineResolver.sameApiClassLoader` + `StringDecryptPlugin.apiClassLoader()`) is retained as a
+safety net for the `@DependsOn` dual-load mistake.
+
+Intentionally deferred (designed, not built): the optional convenience DSL, predicate-matcher helpers
+beyond the basics, and the `PipelineEvaluationBackend` (smalivm/external-oracle) extension point.
+
+---
+
 ## Target User Experience
 
 The script author should not need to manually walk jadx IR for common cases.

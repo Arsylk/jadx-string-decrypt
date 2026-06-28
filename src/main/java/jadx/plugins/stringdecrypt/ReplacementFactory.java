@@ -6,6 +6,7 @@ import java.util.List;
 import org.jetbrains.annotations.Nullable;
 
 import jadx.core.Consts;
+import jadx.core.dex.attributes.AType;
 import jadx.core.dex.instructions.ConstClassNode;
 import jadx.core.dex.instructions.ConstStringNode;
 import jadx.core.dex.instructions.FilledNewArrayNode;
@@ -86,6 +87,13 @@ final class ReplacementFactory {
 		node.copyAttributesFrom(from);
 		node.inheritMetadata(from);
 		node.setOffset(from.getOffset());
+		// AttachMethodDetails (which runs before this pass) cached the *replaced* call's resolved
+		// signature on it as METHOD_DETAILS. A replacement is a structurally different instruction —
+		// notably DeindirectionResolver turns a reflective Method.invoke(Object, Object[]) into a direct
+		// call with its own signature — so it must not inherit the old details, or MethodInvokeVisitor
+		// would type the new args against Method.invoke's (Object, Object[]) and insert bogus (Object)
+		// casts. Drop it so jadx re-resolves the details from the replacement's own callMth.
+		node.remove(AType.METHOD_DETAILS);
 	}
 
 	private static @Nullable InsnNode makeScalarInsn(Object value, @Nullable ArgType targetType) {

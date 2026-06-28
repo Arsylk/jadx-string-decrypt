@@ -32,11 +32,22 @@ public abstract class ReflectiveJdkHandler implements JdkClassHandler {
 	private final Set<String> allowedMethods = new HashSet<>();
 
 	protected ReflectiveJdkHandler(String targetClassName) {
-		this.targetClassName = targetClassName;
+		this(targetClassName, targetClassName);
+	}
+
+	/**
+	 * @param dispatchClassName the name the interpreter dispatches on, i.e. jadx's dotted
+	 *        {@code getFullName()} (for a nested class this is {@code java.util.Base64.Decoder}).
+	 * @param reflectClassName the name handed to {@link Class#forName(String)} (for a nested class
+	 *        the binary {@code $} form, e.g. {@code java.util.Base64$Decoder}). For a top-level class
+	 *        the two are identical.
+	 */
+	protected ReflectiveJdkHandler(String dispatchClassName, String reflectClassName) {
+		this.targetClassName = dispatchClassName;
 		try {
-			this.clazz = Class.forName(targetClassName);
+			this.clazz = Class.forName(reflectClassName);
 		} catch (ClassNotFoundException e) {
-			throw new IllegalStateException("JDK class not found: " + targetClassName, e);
+			throw new IllegalStateException("JDK class not found: " + reflectClassName, e);
 		}
 		registerMethods(allowedMethods);
 	}
