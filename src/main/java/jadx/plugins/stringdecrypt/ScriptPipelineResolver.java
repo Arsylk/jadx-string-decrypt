@@ -48,11 +48,12 @@ final class ScriptPipelineResolver implements Resolver {
 		if (!(ctx.insn instanceof InvokeNode)) {
 			return null;
 		}
-		PipelineFrame frame = new PipelineFrame(ctx.mth, ctx.ev, ctx.oev, ctx.insn);
-		List<PipelineRegistration> candidates = registry.candidatesFor(frame.rawFullId());
+		String rawFullId = ((InvokeNode) ctx.insn).getCallMth().getRawFullId();
+		List<PipelineRegistration> candidates = registry.candidatesFor(rawFullId);
 		if (candidates == null) {
 			return null;
 		}
+		PipelineFrame frame = new PipelineFrame(ctx.mth, ctx.ev, ctx.oev, ctx.insn);
 		for (PipelineRegistration reg : candidates) {
 			if (!reg.isEnabled()) {
 				continue;

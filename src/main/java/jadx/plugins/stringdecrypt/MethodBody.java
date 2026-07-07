@@ -82,9 +82,11 @@ final class MethodBody {
 
 	final Op[] ops;
 	final int[] argRegs; // register numbers of the method parameters, in order
+	final int maxReg;
 
-	MethodBody(Op[] ops, int[] argRegs) {
+	MethodBody(Op[] ops, int[] argRegs, int maxReg) {
 		this.ops = ops;
 		this.argRegs = argRegs;
+		this.maxReg = maxReg;
 	}
 }

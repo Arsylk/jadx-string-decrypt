@@ -75,6 +75,65 @@ final class Eval {
 		}
 	}
 
+	static @Nullable String tryDecodeBase64String(String encoded) {
+		try {
+			return new String(java.util.Base64.getDecoder().decode(encoded), StandardCharsets.UTF_8);
+		} catch (Exception e) {
+			return null;
+		}
+	}
+
+	static @Nullable String tryDecodePrefixedRc4(String encoded) {
+		try {
+			if (encoded == null || encoded.length() <= 12) {
+				return null;
+			}
+			byte[] key = encoded.substring(0, 12).getBytes(StandardCharsets.UTF_8);
+			String hex = new String(java.util.Base64.getDecoder().decode(encoded.substring(12)), StandardCharsets.UTF_8);
+			if ((hex.length() & 1) != 0) {
+				return null;
+			}
+			byte[] data = new byte[hex.length() / 2];
+			for (int i = 0; i < hex.length(); i += 2) {
+				int hi = Character.digit(hex.charAt(i), 16);
+				int lo = Character.digit(hex.charAt(i + 1), 16);
+				if (hi < 0 || lo < 0) {
+					return null;
+				}
+				data[i / 2] = (byte) ((hi << 4) + lo);
+			}
+			return new String(rc4(key, data), StandardCharsets.UTF_8);
+		} catch (Exception e) {
+			return null;
+		}
+	}
+
+	private static byte[] rc4(byte[] key, byte[] data) {
+		int[] s = new int[256];
+		for (int i = 0; i < 256; i++) {
+			s[i] = i;
+		}
+		int j = 0;
+		for (int i = 0; i < 256; i++) {
+			j = (((j + s[i]) + key[i % key.length]) + 256) % 256;
+			int t = s[i];
+			s[i] = s[j];
+			s[j] = t;
+		}
+		byte[] out = new byte[data.length];
+		int i = 0;
+		j = 0;
+		for (int k = 0; k < data.length; k++) {
+			i = (i + 1) % 256;
+			j = (j + s[i]) % 256;
+			int t = s[i];
+			s[i] = s[j];
+			s[j] = t;
+			out[k] = (byte) (s[(s[i] + s[j]) % 256] ^ data[k]);
+		}
+		return out;
+	}
+
 	static boolean isPrintable(String s) {
 		if (s.isEmpty()) {
 			return false;
@@ -129,6 +188,8 @@ final class Eval {
 	static void buildKeyData(ClassNode cls, KeyData keys, boolean detectDecryptors) {
 		try {
 			buildOne(cls, keys);
+			detectBase64StringHelpers(cls, keys);
+			buildInstanceStringFields(cls, keys);
 			if (detectDecryptors) {
 				detectDecryptors(cls, keys);
 			}
@@ -162,9 +223,10 @@ final class Eval {
 					continue;
 				}
 				boolean isClinit = mth == clinit;
+				boolean isConstructor = mth.isConstructor();
 				boolean wasLoaded = mth.getInstructions() != null;
 				try {
-					scanMethodForMutations(cls, mth, isClinit, keys);
+					scanMethodForMutations(cls, mth, isClinit, isConstructor, keys);
 				} catch (Throwable t) {
 					// ignore: a method we can't scan just won't unlock folding for the fields it touches
 				} finally {
@@ -176,7 +238,7 @@ final class Eval {
 		}
 	}
 
-	private static void scanMethodForMutations(ClassNode cls, MethodNode mth, boolean isClinit, KeyData keys) {
+	private static void scanMethodForMutations(ClassNode cls, MethodNode mth, boolean isClinit, boolean isConstructor, KeyData keys) {
 		InsnNode[] insns = rawInsns(mth);
 		if (insns == null) {
 			return;
@@ -189,6 +251,11 @@ final class Eval {
 			if (insn.getType() == InsnType.SPUT) {
 				FieldInfo f = fieldOf(insn);
 				if (f != null && !isDeclaringClinitWrite(cls, isClinit, f)) {
+					keys.mutableFields().add(f.getRawFullId());
+				}
+			} else if (insn.getType() == InsnType.IPUT) {
+				FieldInfo f = fieldOf(insn);
+				if (f != null && !isDeclaringConstructorWrite(cls, isConstructor, f)) {
 					keys.mutableFields().add(f.getRawFullId());
 				}
 			} else if (insn.getType() == InsnType.APUT) {
@@ -231,12 +298,18 @@ final class Eval {
 		return isClinit && cls.getClassInfo().equals(f.getDeclClass());
 	}
 
+	private static boolean isDeclaringConstructorWrite(ClassNode cls, boolean isConstructor, FieldInfo f) {
+		return isConstructor && cls.getClassInfo().equals(f.getDeclClass());
+	}
+
 	// ------------------------------------------------------------------------------------------
 	// pure-helper body snapshots (for interprocedural folding)
 	// ------------------------------------------------------------------------------------------
 
-	/** Whitelisted instruction count above which a method is too large to be a foldable helper. */
+	/** Whitelisted instruction count above which a normal method is too large to be a foldable helper. */
 	private static final int SNAPSHOT_MAX_INSNS = 512;
+	/** Larger cap for the common inline byte-array XOR string helper: big switch/if ladder, still pure. */
+	private static final int SNAPSHOT_MAX_INLINE_XOR_STRING_INSNS = 10_000;
 
 	/**
 	 * Snapshot every static method in {@code cls} that returns a {@code String} or integral value and
@@ -256,7 +329,12 @@ final class Eval {
 			try {
 				MethodBody body = snapshotBody(mth);
 				if (body != null) {
-					keys.bodies().put(mth.getMethodInfo().getRawFullId(), body);
+					String id = mth.getMethodInfo().getRawFullId();
+					keys.bodies().put(id, body);
+					Map<Long, String> inlineXor = buildInlineXorStringTable(mth, body, keys);
+					if (!inlineXor.isEmpty()) {
+						keys.inlineXorStrings().put(id, inlineXor);
+					}
 				}
 			} catch (Throwable t) {
 				// a method that can't be snapshotted simply won't be folded — debug-log so an
@@ -292,6 +370,7 @@ final class Eval {
 		// Pass 1: build a dex-offset -> op-array-index map. The raw insn array is offset-indexed (so
 		// IF/GOTO targets are array indices in `insns`); we need to translate those to compact op-array
 		// indices since the snapshot skips null/NOP slots.
+		int maxInsns = snapshotMaxInsns(mth, insns);
 		Map<Integer, Integer> offsetToOpIndex = new HashMap<>();
 		int opCount = 0;
 		for (int i = 0; i < insns.length; i++) {
@@ -300,7 +379,7 @@ final class Eval {
 			}
 			offsetToOpIndex.put(i, opCount);
 			opCount++;
-			if (opCount > SNAPSHOT_MAX_INSNS) {
+			if (opCount > maxInsns) {
 				return null;
 			}
 		}
@@ -323,10 +402,240 @@ final class Eval {
 		}
 		List<RegisterArg> argRegs = mth.getArgRegs();
 		int[] regs = new int[argRegs.size()];
+		int maxReg = -1;
 		for (int i = 0; i < regs.length; i++) {
 			regs[i] = argRegs.get(i).getRegNum();
+			maxReg = Math.max(maxReg, regs[i]);
 		}
-		return new MethodBody(ops.toArray(new MethodBody.Op[0]), regs);
+		for (MethodBody.Op op : ops) {
+			maxReg = Math.max(maxReg, op.resultReg);
+			for (MethodBody.Arg arg : op.args) {
+				if (!arg.literal) {
+					maxReg = Math.max(maxReg, arg.reg);
+				}
+			}
+		}
+		return new MethodBody(ops.toArray(new MethodBody.Op[0]), regs, maxReg);
+	}
+
+	private static int snapshotMaxInsns(MethodNode mth, InsnNode[] insns) {
+		if (isInlineXorStringHelperShape(mth, insns)) {
+			return SNAPSHOT_MAX_INLINE_XOR_STRING_INSNS;
+		}
+		return SNAPSHOT_MAX_INSNS;
+	}
+
+	/**
+	 * Common obfuscator helper shape:
+	 * {@code static String a(int key) { if (key == C) { byte[] b = ...; ... b[i] ^= key; return new String(b, UTF_8); } ... }}.
+	 * These are often thousands of raw instructions because one method contains all string cases, but
+	 * they are still deterministic and pure, so allow a larger snapshot budget only for this narrow shape.
+	 */
+	private static boolean isInlineXorStringHelperShape(MethodNode mth, InsnNode[] insns) {
+		MethodInfo mi = mth.getMethodInfo();
+		if (mi.getArgsCount() != 1 || !ArgType.INT.equals(mi.getArgumentsTypes().get(0))) {
+			return false;
+		}
+		ArgType ret = mi.getReturnType();
+		if (ret == null || !ret.isObject() || !"java.lang.String".equals(ret.getObject())) {
+			return false;
+		}
+		boolean hasByteArray = false;
+		boolean hasXor = false;
+		boolean hasStringCtor = false;
+		for (InsnNode insn : insns) {
+			if (insn == null) {
+				continue;
+			}
+			if (insn.getType() == InsnType.NEW_ARRAY && insn instanceof NewArrayNode) {
+				ArgType arrType = ((NewArrayNode) insn).getArrayType();
+				hasByteArray |= arrType != null && arrType.isArray() && ArgType.BYTE.equals(arrType.getArrayElement());
+			} else if (insn.getType() == InsnType.ARITH && insn instanceof ArithNode) {
+				hasXor |= ((ArithNode) insn).getOp() == jadx.core.dex.instructions.ArithOp.XOR;
+			} else if (insn.getType() == InsnType.INVOKE && insn instanceof InvokeNode) {
+				MethodInfo call = ((InvokeNode) insn).getCallMth();
+				hasStringCtor |= call.isConstructor() && "java.lang.String".equals(call.getDeclClass().getFullName());
+			}
+		}
+		return hasByteArray && hasXor && hasStringCtor;
+	}
+
+	private static Map<Long, String> buildInlineXorStringTable(MethodNode mth, MethodBody body, KeyData keys) {
+		if (!isInlineXorStringHelperShape(mth, rawInsns(mth))) {
+			return java.util.Collections.emptyMap();
+		}
+		int argReg = body.argRegs.length == 1 ? body.argRegs[0] : -1;
+		if (argReg < 0) {
+			return java.util.Collections.emptyMap();
+		}
+		Map<Long, String> out = new HashMap<>();
+		MethodBody.Op[] ops = body.ops;
+		for (int pc = 0; pc < ops.length; pc++) {
+			MethodBody.Op op = ops[pc];
+			if (op.type != InsnType.IF || op.args.length < 2) {
+				continue;
+			}
+			Long key = inlineXorBranchKey(op, argReg);
+			if (key == null || out.containsKey(key)) {
+				continue;
+			}
+			String decoded = simulateInlineXorBranch(ops, op.branchTarget, key, keys);
+			if (decoded != null && isPrintable(decoded)) {
+				out.put(key, decoded);
+			}
+		}
+		return out;
+	}
+
+	@Nullable
+	private static Long inlineXorBranchKey(MethodBody.Op op, int argReg) {
+		MethodBody.Arg a = op.args[0];
+		MethodBody.Arg b = op.args[1];
+		if (!a.literal && a.reg == argReg && b.literal) {
+			return b.value;
+		}
+		if (!b.literal && b.reg == argReg && a.literal) {
+			return a.value;
+		}
+		return null;
+	}
+
+	@Nullable
+	private static String simulateInlineXorBranch(MethodBody.Op[] ops, int startPc, long key, KeyData keys) {
+		Map<Integer, Long> longs = new HashMap<>();
+		Map<Integer, byte[]> arrays = new HashMap<>();
+		for (int pc = startPc, count = 0; pc >= 0 && pc < ops.length && count++ < 20_000; pc++) {
+			MethodBody.Op op = ops[pc];
+			switch (op.type) {
+				case CONST:
+					putLong(longs, op.resultReg, valueOf(longs, op.args[0]));
+					break;
+				case MOVE:
+					if (arrays.containsKey(op.args[0].reg)) {
+						arrays.put(op.resultReg, arrays.get(op.args[0].reg));
+					} else {
+						putLong(longs, op.resultReg, valueOf(longs, op.args[0]));
+					}
+					break;
+				case NEW_ARRAY: {
+					Long size = valueOf(longs, op.args[0]);
+					if (size == null || size < 0 || size > keys.maxArraySize()) {
+						return null;
+					}
+					arrays.put(op.resultReg, new byte[size.intValue()]);
+					break;
+				}
+				case FILL_ARRAY: {
+					byte[] arr = arrays.get(op.args[0].reg);
+					if (arr != null && op.payload instanceof long[]) {
+						long[] data = (long[]) op.payload;
+						for (int i = 0; i < data.length && i < arr.length; i++) {
+							arr[i] = (byte) data[i];
+						}
+					}
+					break;
+				}
+				case APUT: {
+					byte[] arr = arrays.get(op.args[0].reg);
+					Long idx = valueOf(longs, op.args[1]);
+					Long val = valueOf(longs, op.args[2]);
+					if (arr != null && idx != null && val != null && idx >= 0 && idx < arr.length) {
+						arr[idx.intValue()] = (byte) val.longValue();
+					}
+					break;
+				}
+				case AGET: {
+					byte[] arr = arrays.get(op.args[0].reg);
+					Long idx = valueOf(longs, op.args[1]);
+					if (arr == null || idx == null || idx < 0 || idx >= arr.length) {
+						return null;
+					}
+					putLong(longs, op.resultReg, (long) arr[idx.intValue()]);
+					break;
+				}
+				case CAST:
+				case CHECK_CAST:
+					putLong(longs, op.resultReg, valueOf(longs, op.args[0]));
+					break;
+				case ARITH: {
+					Long a = valueOf(longs, op.args[0]);
+					Long b = valueOf(longs, op.args[1]);
+					Long r = a != null && b != null ? arithInline(op.arithOp, a, b) : null;
+					putLong(longs, op.resultReg, r);
+					break;
+				}
+				case IF: {
+					Long a = valueOf(longs, op.args[0]);
+					Long b = valueOf(longs, op.args[1]);
+					if (a != null && b != null && compare(op.ifOp, a, b)) {
+						pc = op.branchTarget - 1;
+					}
+					break;
+				}
+				case GOTO:
+					pc = op.branchTarget - 1;
+					break;
+				case INVOKE:
+					if (op.callMth != null && op.callMth.isConstructor()
+							&& "java.lang.String".equals(op.callMth.getDeclClass().getFullName())
+							&& op.args.length >= 2 && arrays.containsKey(op.args[1].reg)) {
+						return new String(arrays.get(op.args[1].reg), java.nio.charset.StandardCharsets.UTF_8);
+					}
+					break;
+				case RETURN:
+					return null;
+				default:
+					break;
+			}
+		}
+		return null;
+	}
+
+	private static void putLong(Map<Integer, Long> map, int reg, @Nullable Long value) {
+		if (reg >= 0 && value != null) {
+			map.put(reg, value);
+		}
+	}
+
+	@Nullable
+	private static Long valueOf(Map<Integer, Long> map, MethodBody.Arg arg) {
+		return arg.literal ? arg.value : map.get(arg.reg);
+	}
+
+	@Nullable
+	private static Long arithInline(@Nullable jadx.core.dex.instructions.ArithOp op, long a, long b) {
+		if (op == null) {
+			return null;
+		}
+		switch (op) {
+			case ADD: return a + b;
+			case SUB: return a - b;
+			case MUL: return a * b;
+			case DIV: return b != 0 ? a / b : null;
+			case REM: return b != 0 ? a % b : null;
+			case AND: return a & b;
+			case OR: return a | b;
+			case XOR: return a ^ b;
+			case SHL: return a << ((int) b & 63);
+			case SHR: return a >> ((int) b & 63);
+			case USHR: return a >>> ((int) b & 63);
+			default: return null;
+		}
+	}
+
+	private static boolean compare(@Nullable jadx.core.dex.instructions.IfOp op, long a, long b) {
+		if (op == null) {
+			return false;
+		}
+		switch (op) {
+			case EQ: return a == b;
+			case NE: return a != b;
+			case LT: return a < b;
+			case LE: return a <= b;
+			case GT: return a > b;
+			case GE: return a >= b;
+			default: return false;
+		}
 	}
 
 	private static @Nullable MethodBody.Op snapshotOp(InsnNode insn, Map<Integer, Integer> offsetToOpIndex, InsnNode[] insns) {
@@ -456,6 +765,148 @@ final class Eval {
 			}
 		}
 		return false;
+	}
+
+	private static void buildInstanceStringFields(ClassNode cls, KeyData keys) {
+		for (MethodNode mth : cls.getMethods()) {
+			if (!mth.isConstructor() || mth.isNoCode()) {
+				continue;
+			}
+			InsnNode[] insns = rawInsns(mth);
+			if (insns == null) {
+				continue;
+			}
+			Map<Integer, String> regStr = new HashMap<>();
+			String pendingString = null;
+			Map<String, String> seen = new HashMap<>();
+			java.util.Set<String> conflict = new java.util.HashSet<>();
+			for (InsnNode insn : insns) {
+				if (insn == null) {
+					continue;
+				}
+				switch (insn.getType()) {
+					case CONST_STR: {
+						RegisterArg res = insn.getResult();
+						if (res != null) {
+							regStr.put(res.getRegNum(), ((ConstStringNode) insn).getString());
+						}
+						break;
+					}
+					case MOVE: {
+						RegisterArg res = insn.getResult();
+						if (res != null && insn.getArg(0) instanceof RegisterArg) {
+							String s = regStr.get(((RegisterArg) insn.getArg(0)).getRegNum());
+							if (s != null) {
+								regStr.put(res.getRegNum(), s);
+							}
+						}
+						break;
+					}
+					case INVOKE: {
+						pendingString = null;
+						if (!(insn instanceof InvokeNode)) {
+							break;
+						}
+						InvokeNode inv = (InvokeNode) insn;
+						MethodInfo call = inv.getCallMth();
+						if (!call.getDeclClass().equals(cls.getClassInfo()) || inv.getArgsCount() < inv.getFirstArgOffset() + 1) {
+							break;
+						}
+						InsnArg arg = inv.getArg(inv.getFirstArgOffset());
+						String in = arg instanceof RegisterArg ? regStr.get(((RegisterArg) arg).getRegNum()) : null;
+						if (in == null) {
+							break;
+						}
+						if ("b".equals(call.getName())) {
+							pendingString = tryDecodePrefixedRc4(in);
+						} else if ("a".equals(call.getName()) && keys.base64StringHelpers().contains(call.getRawFullId())) {
+							pendingString = tryDecodeBase64String(in);
+						}
+						break;
+					}
+					case MOVE_RESULT: {
+						RegisterArg res = insn.getResult();
+						if (res != null && pendingString != null) {
+							regStr.put(res.getRegNum(), pendingString);
+						}
+						pendingString = null;
+						break;
+					}
+					case IPUT: {
+						FieldInfo f = fieldOf(insn);
+						if (f == null || !f.getType().isObject() || !"java.lang.String".equals(f.getType().getObject())) {
+							break;
+						}
+						String val = null;
+						InsnArg src = insn.getArg(0);
+						if (src instanceof RegisterArg) {
+							val = regStr.get(((RegisterArg) src).getRegNum());
+						}
+						if (val == null) {
+							break;
+						}
+						String id = f.getRawFullId();
+						String prev = seen.putIfAbsent(id, val);
+						if (prev != null && !prev.equals(val)) {
+							conflict.add(id);
+						}
+						break;
+					}
+					default:
+						break;
+				}
+			}
+			for (Map.Entry<String, String> e : seen.entrySet()) {
+				if (!conflict.contains(e.getKey())) {
+					keys.instanceStrings().putIfAbsent(e.getKey(), e.getValue());
+				}
+			}
+		}
+	}
+
+	private static void detectBase64StringHelpers(ClassNode cls, KeyData keys) {
+		for (MethodNode mth : cls.getMethods()) {
+			if (!isBase64StringHelper(mth)) {
+				continue;
+			}
+			keys.base64StringHelpers().add(mth.getMethodInfo().getRawFullId());
+		}
+	}
+
+	private static boolean isBase64StringHelper(MethodNode mth) {
+		if (mth.isNoCode()) {
+			return false;
+		}
+		MethodInfo mi = mth.getMethodInfo();
+		ArgType ret = mi.getReturnType();
+		if (mi.getArgsCount() != 1 || !mi.getArgumentsTypes().get(0).isObject()
+				|| ret == null || !ret.isObject() || !"java.lang.String".equals(ret.getObject())) {
+			return false;
+		}
+		InsnNode[] insns = rawInsns(mth);
+		if (insns == null) {
+			return false;
+		}
+		boolean hasBase64Decode = false;
+		boolean hasStringCtor = false;
+		boolean hasNonJdkInvoke = false;
+		for (InsnNode insn : insns) {
+			if (insn == null || insn.getType() != InsnType.INVOKE || !(insn instanceof InvokeNode)) {
+				continue;
+			}
+			MethodInfo call = ((InvokeNode) insn).getCallMth();
+			String decl = call.getDeclClass().getFullName();
+			String name = call.getName();
+			if ("decode".equals(name) && ("android.util.Base64".equals(decl)
+					|| "java.util.Base64.Decoder".equals(decl) || "java.util.Base64$Decoder".equals(decl))) {
+				hasBase64Decode = true;
+			} else if (call.isConstructor() && "java.lang.String".equals(decl)) {
+				hasStringCtor = true;
+			} else if (!decl.startsWith("java.")) {
+				hasNonJdkInvoke = true;
+			}
+		}
+		return hasBase64Decode && hasStringCtor && !hasNonJdkInvoke;
 	}
 
 	private static void buildOne(ClassNode cls, KeyData keys) {

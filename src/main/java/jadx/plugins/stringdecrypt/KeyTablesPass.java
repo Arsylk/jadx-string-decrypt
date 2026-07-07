@@ -43,7 +43,9 @@ public class KeyTablesPass implements JadxPreparePass {
 		for (ClassNode cls : root.getClasses()) {
 			Eval.buildKeyData(cls, keys, detectDecryptors);
 		}
-		Eval.scanMutableFields(root, keys);
+		if (keys.size() != 0 || !keys.instanceStrings().isEmpty()) {
+			Eval.scanMutableFields(root, keys);
+		}
 		LOG.info("string-decrypt: reconstructed {} constant(s) ({} arrays, {} scalars), detected {} decryptor(s),"
 				+ " snapshotted {} pure helper body(ies), {} mutable static field(s) excluded from folding",
 				keys.size(), keys.arrays().size(), keys.scalars().size(), keys.decryptors().size(),

@@ -3,8 +3,11 @@ package jadx.plugins.stringdecrypt.jdk;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 
 import org.jetbrains.annotations.Nullable;
 
@@ -30,6 +33,8 @@ public abstract class ReflectiveJdkHandler implements JdkClassHandler {
 	private final String targetClassName;
 	private final Class<?> clazz;
 	private final Set<String> allowedMethods = new HashSet<>();
+	private final ConcurrentMap<MemberKey, Method> methodCache = new ConcurrentHashMap<>();
+	private final ConcurrentMap<MemberKey, Constructor<?>> ctorCache = new ConcurrentHashMap<>();
 
 	protected ReflectiveJdkHandler(String targetClassName) {
 		this(targetClassName, targetClassName);
@@ -82,9 +87,8 @@ public abstract class ReflectiveJdkHandler implements JdkClassHandler {
 		}
 		try {
 			if (isCtor) {
-				Constructor<?> ctor = clazz.getDeclaredConstructor(paramTypes);
-				ctor.setAccessible(true);
-				return ctor.newInstance(coerced);
+				Constructor<?> ctor = resolveConstructor(paramTypes);
+				return ctor != null ? ctor.newInstance(coerced) : null;
 			}
 			Method m = resolveMethod(name, paramTypes);
 			if (m == null) {
@@ -93,7 +97,6 @@ public abstract class ReflectiveJdkHandler implements JdkClassHandler {
 			if (isIdentityNondeterministic(instance, name)) {
 				return null;
 			}
-			m.setAccessible(true);
 			return m.invoke(instance, coerced);
 		} catch (InvocationTargetException ite) {
 			return null; // a guarded throw (e.g. NumberFormatException) -> can't fold, refuse
@@ -120,16 +123,69 @@ public abstract class ReflectiveJdkHandler implements JdkClassHandler {
 		}
 	}
 
-	private @Nullable Method resolveMethod(String name, Class<?>[] paramTypes) {
-		try {
-			return clazz.getMethod(name, paramTypes);
-		} catch (NoSuchMethodException ignore) {
-			// fall through to declared (covers package-private static helpers, e.g. Arrays.copyOfRangeByte)
+	private @Nullable Constructor<?> resolveConstructor(Class<?>[] paramTypes) {
+		MemberKey key = new MemberKey("<init>", paramTypes);
+		Constructor<?> cached = ctorCache.get(key);
+		if (cached != null) {
+			return cached;
 		}
 		try {
-			return clazz.getDeclaredMethod(name, paramTypes);
+			Constructor<?> ctor = clazz.getDeclaredConstructor(paramTypes);
+			ctor.setAccessible(true);
+			Constructor<?> prev = ctorCache.putIfAbsent(key, ctor);
+			return prev != null ? prev : ctor;
 		} catch (NoSuchMethodException ignore) {
 			return null;
+		}
+	}
+
+	private @Nullable Method resolveMethod(String name, Class<?>[] paramTypes) {
+		MemberKey key = new MemberKey(name, paramTypes);
+		Method cached = methodCache.get(key);
+		if (cached != null) {
+			return cached;
+		}
+		Method method;
+		try {
+			method = clazz.getMethod(name, paramTypes);
+		} catch (NoSuchMethodException ignore) {
+			try {
+				method = clazz.getDeclaredMethod(name, paramTypes);
+			} catch (NoSuchMethodException ignore2) {
+				return null;
+			}
+		}
+		method.setAccessible(true);
+		Method prev = methodCache.putIfAbsent(key, method);
+		return prev != null ? prev : method;
+	}
+
+	private static final class MemberKey {
+		private final String name;
+		private final Class<?>[] params;
+		private final int hash;
+
+		MemberKey(String name, Class<?>[] params) {
+			this.name = name;
+			this.params = params.clone();
+			this.hash = 31 * name.hashCode() + Arrays.hashCode(this.params);
+		}
+
+		@Override
+		public boolean equals(Object obj) {
+			if (this == obj) {
+				return true;
+			}
+			if (!(obj instanceof MemberKey)) {
+				return false;
+			}
+			MemberKey other = (MemberKey) obj;
+			return name.equals(other.name) && Arrays.equals(params, other.params);
+		}
+
+		@Override
+		public int hashCode() {
+			return hash;
 		}
 	}
 }

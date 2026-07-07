@@ -22,7 +22,6 @@ import jadx.core.dex.instructions.args.InsnWrapArg;
 import jadx.core.dex.instructions.args.LiteralArg;
 import jadx.core.dex.instructions.args.RegisterArg;
 import jadx.core.dex.instructions.args.SSAVar;
-import jadx.core.dex.nodes.BlockNode;
 import jadx.core.dex.nodes.InsnNode;
 import jadx.core.dex.nodes.MethodNode;
 import jadx.core.utils.InsnUtils;
@@ -43,15 +42,17 @@ final class Evaluator {
 	private final MethodNode mth;
 	private final KeyData keys;
 	private final PureFold pureFold;
+	private final MethodInsnIndex insnIndex;
 	private final IdentityHashMap<SSAVar, long[]> localArrays = new IdentityHashMap<>();
 	private final Set<FilledNewArrayNode> filledInProgress = Collections.newSetFromMap(new IdentityHashMap<>());
 	private final Set<InsnNode> activePhi = Collections.newSetFromMap(new IdentityHashMap<>());
 	private final IdentityHashMap<InsnNode, Long> evalCache = new IdentityHashMap<>(); // memoize evalInt
 
-	Evaluator(MethodNode mth, KeyData keys) {
+	Evaluator(MethodNode mth, KeyData keys, PureFold pureFold, MethodInsnIndex insnIndex) {
 		this.mth = mth;
 		this.keys = keys;
-		this.pureFold = new PureFold(keys);
+		this.pureFold = pureFold;
+		this.insnIndex = insnIndex;
 	}
 
 	// ------------------------------------------------------------------------------------------
@@ -127,33 +128,24 @@ final class Evaluator {
 
 	/** Apply every {@code aput} into {@code arrArg} in program order (last write wins). */
 	private boolean applyByteAputs(RegisterArg arrArg, byte[] out) {
-		for (BlockNode block : mth.getBasicBlocks()) {
-			for (InsnNode insn : block.getInstructions()) {
-				if (insn.getType() == InsnType.APUT && insn.getArg(0).isSameVar(arrArg)) {
-					Long idx = evalInt(insn.getArg(1), 0);
-					Long val = evalInt(insn.getArg(2), 0);
-					if (idx == null || val == null) {
-						return false;
-					}
-					int i = idx.intValue();
-					if (i < 0 || i >= out.length) {
-						return false;
-					}
-					out[i] = val.byteValue();
-				}
+		for (InsnNode insn : insnIndex.aputsFor(arrArg)) {
+			Long idx = evalInt(insn.getArg(1), 0);
+			Long val = evalInt(insn.getArg(2), 0);
+			if (idx == null || val == null) {
+				return false;
 			}
+			int i = idx.intValue();
+			if (i < 0 || i >= out.length) {
+				return false;
+			}
+			out[i] = val.byteValue();
 		}
 		return true;
 	}
 
 	@Nullable
 	private FillArrayInsn findFill(SSAVar sVar) {
-		for (RegisterArg use : sVar.getUseList()) {
-			if (use.getParentInsn() instanceof FillArrayInsn) {
-				return (FillArrayInsn) use.getParentInsn();
-			}
-		}
-		return null;
+		return insnIndex.fillFor(sVar);
 	}
 
 	private static java.util.List<LiteralArg> asLiteralArgs(FillArrayInsn fill, ArgType elem) {
@@ -391,21 +383,17 @@ final class Evaluator {
 		// 2) Apply APUTs in program order (last write wins). Critically, this means a downstream AGET
 		//    that reads a mutated index sees the POST-APUT value — required for the obfuscator pattern
 		//    `byte[] arr = {…}; arr[k] = X; … BigInteger.valueOf(arr[k] + N)` to fold correctly.
-		for (BlockNode block : mth.getBasicBlocks()) {
-			for (InsnNode insn : block.getInstructions()) {
-				if (insn.getType() == InsnType.APUT && insn.getArg(0).isSameVar(arrArg)) {
-					Long idx = evalInt(insn.getArg(1), 0);
-					Long val = evalInt(insn.getArg(2), 0);
-					if (idx == null || val == null) {
-						return null;
-					}
-					int i = idx.intValue();
-					if (i < 0 || i >= size) {
-						return null;
-					}
-					table[i] = Eval.extend(elem, val);
-				}
+		for (InsnNode insn : insnIndex.aputsFor(arrArg)) {
+			Long idx = evalInt(insn.getArg(1), 0);
+			Long val = evalInt(insn.getArg(2), 0);
+			if (idx == null || val == null) {
+				return null;
 			}
+			int i = idx.intValue();
+			if (i < 0 || i >= size) {
+				return null;
+			}
+			table[i] = Eval.extend(elem, val);
 		}
 		localArrays.put(sVar, table);
 		return table;
@@ -437,21 +425,17 @@ final class Evaluator {
 			return table; // re-entered: just expose the inline-literal view to the inner caller
 		}
 		try {
-			for (BlockNode block : mth.getBasicBlocks()) {
-				for (InsnNode insn : block.getInstructions()) {
-					if (insn.getType() == InsnType.APUT && insn.getArg(0).isSameVar(result)) {
-						Long idx = evalInt(insn.getArg(1), 0);
-						Long val = evalInt(insn.getArg(2), 0);
-						if (idx == null || val == null) {
-							continue; // skip APUT we can't resolve; keep the inline value at that slot
-						}
-						int i = idx.intValue();
-						if (i < 0 || i >= table.length) {
-							continue;
-						}
-						table[i] = Eval.extend(elem, val);
-					}
+			for (InsnNode insn : insnIndex.aputsFor(result)) {
+				Long idx = evalInt(insn.getArg(1), 0);
+				Long val = evalInt(insn.getArg(2), 0);
+				if (idx == null || val == null) {
+					continue; // skip APUT we can't resolve; keep the inline value at that slot
 				}
+				int i = idx.intValue();
+				if (i < 0 || i >= table.length) {
+					continue;
+				}
+				table[i] = Eval.extend(elem, val);
 			}
 		} finally {
 			filledInProgress.remove(fa);

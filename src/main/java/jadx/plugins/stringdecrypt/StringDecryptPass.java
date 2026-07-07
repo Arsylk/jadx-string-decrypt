@@ -74,6 +74,8 @@ public class StringDecryptPass implements JadxDecompilePass {
 		// rather than edited into tryReplace.
 		this.resolvers = List.of(
 				ctx -> options.isDecryptStrings() ? tryDecrypt(ctx.mth, ctx.ev, ctx.insn, ctx.decrypted, ctx.builtArrays) : null,
+				ctx -> options.isFoldHelperCalls() ? tryDecodeBase64StringHelper(ctx.oev, ctx.insn, ctx.decrypted) : null,
+				ctx -> options.isFoldHelperCalls() ? tryDecodePrefixedRc4String(ctx.oev, ctx.insn, ctx.decrypted) : null,
 				ctx -> options.isFoldHelperCalls() ? tryFoldConstValue(ctx.oev, ctx.insn, ctx.decrypted, ctx.consumerIsLookup) : null,
 				ctx -> options.isFoldHelperCalls() ? tryFoldPureString(ctx.mth, ctx.ev, ctx.insn, ctx.decrypted) : null,
 				// Reflective calls the folders left un-constant get rewritten to direct calls.
@@ -107,11 +109,13 @@ public class StringDecryptPass implements JadxDecompilePass {
 		if (!options.isEnabled() || mth.isNoCode() || mth.contains(AType.JADX_ERROR)) {
 			return;
 		}
-		Evaluator ev = new Evaluator(mth, keys);
-		ObjectEvaluator oev = new ObjectEvaluator(mth, keys, ev, pureFold, jdk);
+		MethodInsnIndex insnIndex = new MethodInsnIndex(mth);
+		Evaluator ev = new Evaluator(mth, keys, pureFold, insnIndex);
+		ObjectEvaluator oev = new ObjectEvaluator(mth, keys, ev, pureFold, jdk, insnIndex);
 		FOLD_OBJ_INVOKES.set(options.isFoldObjectReturningInvokes());
 		List<String> decrypted = new ArrayList<>();
 		List<RegisterArg> builtArrays = new ArrayList<>();
+		boolean[] replacedAny = new boolean[1];
 		for (BlockNode block : mth.getBasicBlocks()) {
 			for (InsnNode insn : block.getInstructions()) {
 				// Per-instruction safety net: this pass interprets adversarial obfuscated code, so an
@@ -119,7 +123,7 @@ public class StringDecryptPass implements JadxDecompilePass {
 				// (which would drop it to an error stub). A throw here means no modification was applied
 				// to this insn — IR stays consistent — so we log and move on.
 				try {
-					replaceWrapped(mth, ev, oev, insn, decrypted, builtArrays);
+					replaceWrapped(mth, ev, oev, insn, decrypted, builtArrays, replacedAny);
 				} catch (RuntimeException e) {
 					LOG.warn("string-decrypt: skipped a wrapped fold in {} ({})", mth, e.toString());
 				}
@@ -128,6 +132,7 @@ public class StringDecryptPass implements JadxDecompilePass {
 				try {
 					InsnNode repl = tryReplace(mth, ev, oev, insn, decrypted, builtArrays, false);
 					if (repl != null) {
+						replacedAny[0] = true;
 						BlockUtils.replaceInsn(mth, block, insn, repl);
 					}
 				} catch (RuntimeException e) {
@@ -136,7 +141,7 @@ public class StringDecryptPass implements JadxDecompilePass {
 			}
 		}
 		int folded = options.isFoldConsts() ? safeFoldIntConstants(mth, ev) : 0;
-		if (options.isCleanup()) {
+		if (options.isCleanup() && (replacedAny[0] || folded > 0 || !builtArrays.isEmpty())) {
 			try {
 				for (RegisterArg arrArg : builtArrays) {
 					cleanupArrayBuild(mth, arrArg);
@@ -528,15 +533,16 @@ public class StringDecryptPass implements JadxDecompilePass {
 	}
 
 	private void replaceWrapped(MethodNode mth, Evaluator ev, ObjectEvaluator oev, InsnNode insn,
-			List<String> decrypted, List<RegisterArg> builtArrays) {
+			List<String> decrypted, List<RegisterArg> builtArrays, boolean[] replacedAny) {
 		boolean outerIsLookup = isReflectiveNameLookupInvoke(insn);
 		for (int i = 0; i < insn.getArgsCount(); i++) {
 			InsnArg arg = insn.getArg(i);
 			if (arg.isInsnWrap()) {
 				InsnNode wrapInsn = ((InsnWrapArg) arg).getWrapInsn();
-				replaceWrapped(mth, ev, oev, wrapInsn, decrypted, builtArrays);
+				replaceWrapped(mth, ev, oev, wrapInsn, decrypted, builtArrays, replacedAny);
 				InsnNode repl = tryReplace(mth, ev, oev, wrapInsn, decrypted, builtArrays, outerIsLookup);
 				if (repl != null) {
+					replacedAny[0] = true;
 					InsnRemover.unbindArgUsage(mth, arg);
 					// A wrapped (inlined) value flows through the wrap, not a result register: the consumer
 					// owns it. Drop any result the resolver copied from the original insn so the following
@@ -581,6 +587,70 @@ public class StringDecryptPass implements JadxDecompilePass {
 			}
 		}
 		return null;
+	}
+
+	private @Nullable InsnNode tryDecodeBase64StringHelper(ObjectEvaluator oev, InsnNode insn, List<String> decrypted) {
+		if (!(insn instanceof InvokeNode)) {
+			return null;
+		}
+		InvokeNode inv = (InvokeNode) insn;
+		if (!keys.base64StringHelpers().contains(inv.getCallMth().getRawFullId())) {
+			return null;
+		}
+		int argOffset = inv.getFirstArgOffset();
+		if (inv.getArgsCount() <= argOffset) {
+			return null;
+		}
+		Object arg = oev.evalObject(inv.getArg(argOffset), 0);
+		if (!(arg instanceof String)) {
+			return null;
+		}
+		String decoded = Eval.tryDecodeBase64String((String) arg);
+		if (decoded == null || decoded.isEmpty()) {
+			return null;
+		}
+		decrypted.add('"' + decoded.replace("\\", "\\\\").replace("\"", "\\\"") + '"');
+		ConstStringNode node = new ConstStringNode(decoded);
+		RegisterArg result = insn.getResult();
+		if (result != null) {
+			node.setResult(result.duplicate());
+		}
+		return node;
+	}
+
+	/**
+	 * Fold the RC4-like helper used by some dumped dynamic dex payloads:
+	 * {@code b(prefix12 + base64(hexRc4Ciphertext))}. The helper body constructs
+	 * {@code new sadness...a.a(prefix.getBytes()).a(hexBytes)}; modelling arbitrary app objects with
+	 * mutable cipher state would be too broad, but this exact carrier is deterministic and common.
+	 */
+	private @Nullable InsnNode tryDecodePrefixedRc4String(ObjectEvaluator oev, InsnNode insn, List<String> decrypted) {
+		if (!(insn instanceof InvokeNode)) {
+			return null;
+		}
+		InvokeNode inv = (InvokeNode) insn;
+		ArgType ret = inv.getCallMth().getReturnType();
+		if (ret == null || !ret.isObject() || !"java.lang.String".equals(ret.getObject()) || inv.getArgsCount() < 1) {
+			return null;
+		}
+		if (!"b".equals(inv.getCallMth().getName())) {
+			return null;
+		}
+		Object arg = oev.evalObject(inv.getArg(inv.getFirstArgOffset()), 0);
+		if (!(arg instanceof String)) {
+			return null;
+		}
+		String decoded = Eval.tryDecodePrefixedRc4((String) arg);
+		if (decoded == null || !Eval.isPrintable(decoded)) {
+			return null;
+		}
+		decrypted.add('"' + decoded.replace("\\", "\\\\").replace("\"", "\\\"") + '"');
+		ConstStringNode node = new ConstStringNode(decoded);
+		RegisterArg result = insn.getResult();
+		if (result != null) {
+			node.setResult(result.duplicate());
+		}
+		return node;
 	}
 
 	/**

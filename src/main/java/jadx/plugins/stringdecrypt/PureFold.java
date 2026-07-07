@@ -1,7 +1,9 @@
 package jadx.plugins.stringdecrypt;
 
-import java.util.HashMap;
+import java.util.Arrays;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 
 import org.jetbrains.annotations.Nullable;
 
@@ -56,6 +58,7 @@ final class PureFold {
 
 	private final KeyData keys;
 	private final JdkInterpreter jdk;
+	private final ConcurrentMap<CallKey, Object> memo = new ConcurrentHashMap<>();
 
 	PureFold(KeyData keys) {
 		this(keys, new JdkInterpreter());
@@ -83,8 +86,31 @@ final class PureFold {
 	 */
 	@Nullable
 	Object foldCall(MethodInfo callMth, Object[] args, int depth) {
-		MethodBody body = keys.bodies().get(callMth.getRawFullId());
-		return body != null ? fold(body, args, depth) : null;
+		if (depth > MAX_DEPTH) {
+			return null;
+		}
+		String methodId = callMth.getRawFullId();
+		Map<Long, String> inlineXor = keys.inlineXorStrings().get(methodId);
+		if (inlineXor != null && args.length == 1 && args[0] instanceof Number) {
+			String decoded = inlineXor.get(((Number) args[0]).longValue());
+			if (decoded != null) {
+				return decoded;
+			}
+		}
+		MethodBody body = keys.bodies().get(methodId);
+		if (body == null) {
+			return null;
+		}
+		CallKey key = new CallKey(methodId, args);
+		Object cached = memo.get(key);
+		if (cached != null) {
+			return cached == NULL ? null : thawCachedValue(cached);
+		}
+		Object folded = fold(body, args, depth);
+		Object cachedValue = folded == null ? NULL : freezeCachedValue(folded);
+		Object prev = memo.putIfAbsent(key, cachedValue);
+		Object resolved = prev != null ? prev : cachedValue;
+		return resolved == NULL ? null : thawCachedValue(resolved);
 	}
 
 	@Nullable
@@ -97,9 +123,9 @@ final class PureFold {
 		if (depth > MAX_DEPTH || body.argRegs.length != args.length) {
 			return null;
 		}
-		Map<Integer, Object> reg = new HashMap<>();
+		Object[] reg = new Object[Math.max(body.maxReg + 1, 0)];
 		for (int k = 0; k < args.length; k++) {
-			reg.put(body.argRegs[k], boxIncoming(args[k]));
+			putReg(reg, body.argRegs[k], boxIncoming(args[k]));
 		}
 		Object pendingResult = null; // set by INVOKE, consumed by MOVE_RESULT
 		int pc = 0;
@@ -331,7 +357,7 @@ final class PureFold {
 		return null; // no return reached (fall off the end)
 	}
 
-	private Object execInvoke(Map<Integer, Object> reg, MethodBody.Op op, int depth) {
+	private Object execInvoke(Object[] reg, MethodBody.Op op, int depth) {
 		MethodInfo callMth = op.callMth;
 		String declClass = callMth.getDeclClass().getFullName();
 		// <init>: construct the object and write it into the new-instance holder (every aliased
@@ -398,7 +424,7 @@ final class PureFold {
 			for (int i = 0; i < args.length; i++) {
 				args[i] = unboxOutgoing(value(reg, op.args[i]));
 			}
-			Object r = fold(callee, args, depth + 1);
+			Object r = foldCall(callMth, args, depth + 1);
 			return r == null ? NULL : boxIncoming(r);
 		}
 		// JDK whitelist fall-through: route any remaining call to the registered handlers. Coerces
@@ -574,6 +600,76 @@ final class PureFold {
 		return null;
 	}
 
+	private static final class CallKey {
+		private final String methodId;
+		private final Object[] args;
+		private final int hash;
+
+		CallKey(String methodId, Object[] args) {
+			this.methodId = methodId;
+			this.args = new Object[args.length];
+			for (int i = 0; i < args.length; i++) {
+				this.args[i] = freezeKeyValue(args[i]);
+			}
+			this.hash = 31 * methodId.hashCode() + Arrays.deepHashCode(this.args);
+		}
+
+		@Override
+		public boolean equals(Object obj) {
+			if (this == obj) {
+				return true;
+			}
+			if (!(obj instanceof CallKey)) {
+				return false;
+			}
+			CallKey other = (CallKey) obj;
+			return methodId.equals(other.methodId) && Arrays.deepEquals(args, other.args);
+		}
+
+		@Override
+		public int hashCode() {
+			return hash;
+		}
+	}
+
+	private static Object freezeKeyValue(Object v) {
+		if (v instanceof byte[]) {
+			return ((byte[]) v).clone();
+		}
+		if (v instanceof char[]) {
+			return ((char[]) v).clone();
+		}
+		if (v instanceof short[]) {
+			return ((short[]) v).clone();
+		}
+		if (v instanceof int[]) {
+			return ((int[]) v).clone();
+		}
+		if (v instanceof long[]) {
+			return ((long[]) v).clone();
+		}
+		if (v instanceof boolean[]) {
+			return ((boolean[]) v).clone();
+		}
+		if (v instanceof Object[]) {
+			Object[] in = (Object[]) v;
+			Object[] out = new Object[in.length];
+			for (int i = 0; i < in.length; i++) {
+				out[i] = freezeKeyValue(in[i]);
+			}
+			return out;
+		}
+		return v;
+	}
+
+	private static Object freezeCachedValue(Object v) {
+		return freezeKeyValue(v);
+	}
+
+	private static Object thawCachedValue(Object v) {
+		return freezeKeyValue(v);
+	}
+
 	private static boolean compare(IfOp op, long a, long b) {
 		switch (op) {
 			case EQ:
@@ -593,15 +689,21 @@ final class PureFold {
 		}
 	}
 
-	private static void put(Map<Integer, Object> reg, MethodBody.Op op, Object value) {
+	private static void put(Object[] reg, MethodBody.Op op, Object value) {
 		if (op.resultReg >= 0) {
-			reg.put(op.resultReg, value);
+			putReg(reg, op.resultReg, value);
+		}
+	}
+
+	private static void putReg(Object[] reg, int regNum, Object value) {
+		if (regNum >= 0 && regNum < reg.length) {
+			reg[regNum] = value;
 		}
 	}
 
 	@Nullable
-	private static Object value(Map<Integer, Object> reg, MethodBody.Arg arg) {
-		return arg.literal ? Long.valueOf(arg.value) : reg.get(arg.reg);
+	private static Object value(Object[] reg, MethodBody.Arg arg) {
+		return arg.literal ? Long.valueOf(arg.value) : (arg.reg >= 0 && arg.reg < reg.length ? reg[arg.reg] : null);
 	}
 
 	@Nullable

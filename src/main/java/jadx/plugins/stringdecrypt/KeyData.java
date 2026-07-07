@@ -14,8 +14,11 @@ public final class KeyData {
 
 	private final Map<String, long[]> arrays = new ConcurrentHashMap<>();
 	private final Map<String, Long> scalars = new ConcurrentHashMap<>();
+	private final Map<String, String> instanceStrings = new ConcurrentHashMap<>();
 	private final Set<String> decryptors = ConcurrentHashMap.newKeySet();
+	private final Set<String> base64StringHelpers = ConcurrentHashMap.newKeySet();
 	private final Map<String, MethodBody> bodies = new ConcurrentHashMap<>();
+	private final Map<String, Map<Long, String>> inlineXorStrings = new ConcurrentHashMap<>();
 	private final Set<String> mutableFields = ConcurrentHashMap.newKeySet();
 	private int maxArraySize = StringDecryptOptions.DEFAULT_MAX_TABLE_SIZE;
 	private String decryptorDesc = StringDecryptOptions.DEFAULT_DECRYPTOR_DESC;
@@ -64,12 +67,27 @@ public final class KeyData {
 		return bodies;
 	}
 
+	/** Precomputed decode table for large {@code static String(int)} inline byte-array XOR helpers. */
+	Map<String, Map<Long, String>> inlineXorStrings() {
+		return inlineXorStrings;
+	}
+
 	public Map<String, Long> scalars() {
 		return scalars;
 	}
 
+	/** Constructor-initialized instance String fields proven constant and not later mutated. */
+	Map<String, String> instanceStrings() {
+		return instanceStrings;
+	}
+
 	public Set<String> decryptors() {
 		return decryptors;
+	}
+
+	/** String(String) helpers whose body directly invokes Base64.decode and new String(...). */
+	Set<String> base64StringHelpers() {
+		return base64StringHelpers;
 	}
 
 	public int size() {

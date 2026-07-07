@@ -10,6 +10,7 @@ import jadx.core.dex.instructions.BaseInvokeNode;
 import jadx.core.dex.instructions.ConstClassNode;
 import jadx.core.dex.instructions.ConstStringNode;
 import jadx.core.dex.instructions.FilledNewArrayNode;
+import jadx.core.dex.instructions.IndexInsnNode;
 import jadx.core.dex.instructions.InsnType;
 import jadx.core.dex.instructions.InvokeNode;
 import jadx.core.dex.instructions.args.ArgType;
@@ -19,7 +20,6 @@ import jadx.core.dex.instructions.args.LiteralArg;
 import jadx.core.dex.instructions.args.RegisterArg;
 import jadx.core.dex.instructions.args.SSAVar;
 import jadx.core.dex.instructions.mods.ConstructorInsn;
-import jadx.core.dex.nodes.BlockNode;
 import jadx.core.dex.nodes.ClassNode;
 import jadx.core.dex.nodes.InsnNode;
 import jadx.core.dex.nodes.MethodNode;
@@ -54,14 +54,17 @@ final class ObjectEvaluator {
 	private final Evaluator intEval;
 	private final PureFold helperFold;
 	private final JdkInterpreter jdk;
+	private final MethodInsnIndex insnIndex;
 	private final IdentityHashMap<InsnNode, Object> cache = new IdentityHashMap<>();
 
-	ObjectEvaluator(MethodNode mth, KeyData keys, Evaluator intEval, PureFold helperFold, JdkInterpreter jdk) {
+	ObjectEvaluator(MethodNode mth, KeyData keys, Evaluator intEval, PureFold helperFold, JdkInterpreter jdk,
+			MethodInsnIndex insnIndex) {
 		this.mth = mth;
 		this.keys = keys;
 		this.intEval = intEval;
 		this.helperFold = helperFold;
 		this.jdk = jdk;
+		this.insnIndex = insnIndex;
 	}
 
 	/**
@@ -138,9 +141,13 @@ final class ObjectEvaluator {
 	private Object evalProducerImpl(InsnNode insn, int depth) {
 		RegisterArg result = insn.getResult();
 		// SGET on a public-static-final field of a whitelisted JDK class (e.g. Integer.TYPE,
-		// Long.TYPE, StandardCharsets.UTF_8) resolves to the actual constant. Anything else refuses.
+		// Long.TYPE, StandardCharsets.UTF_8) resolves to the actual constant. IGET can resolve app
+		// instance String fields proven constructor-constant by the prepare pass.
 		if (insn.getType() == InsnType.SGET) {
 			return resolveStaticField(insn);
+		}
+		if (insn.getType() == InsnType.IGET) {
+			return resolveInstanceStringField(insn);
 		}
 		switch (insn.getType()) {
 			case CONST_STR:
@@ -234,24 +241,20 @@ final class ObjectEvaluator {
 				return out; // no SSA var means no APUTs can target this temp; return as-is
 			}
 			SSAVar sVar = arrReg.getSVar();
-			for (BlockNode block : mth.getBasicBlocks()) {
-				for (InsnNode insn : block.getInstructions()) {
-					if (insn.getType() == InsnType.APUT && insn.getArg(0).isSameVar(arrReg)) {
-						Long idx = intEval.evalInt(insn.getArg(1), 0);
-						if (idx == null) {
-							return null;
-						}
-						int i = idx.intValue();
-						if (i < 0 || i >= out.length) {
-							return null;
-						}
-						Object v = evalArrayElement(insn.getArg(2), depth + 1);
-						if (v == UNRESOLVED_ARRAY_ELEMENT || !storable(javaEl, v)) {
-							return null;
-						}
-						out[i] = v;
-					}
+			for (InsnNode insn : insnIndex.aputsFor(arrReg)) {
+				Long idx = intEval.evalInt(insn.getArg(1), 0);
+				if (idx == null) {
+					return null;
 				}
+				int i = idx.intValue();
+				if (i < 0 || i >= out.length) {
+					return null;
+				}
+				Object v = evalArrayElement(insn.getArg(2), depth + 1);
+				if (v == UNRESOLVED_ARRAY_ELEMENT || !storable(javaEl, v)) {
+					return null;
+				}
+				out[i] = v;
 			}
 			return out;
 		}
@@ -310,6 +313,20 @@ final class ObjectEvaluator {
 
 	private static boolean isStandardJdkClass(String name) {
 		return name.startsWith("java.") || name.startsWith("javax.");
+	}
+
+	@Nullable
+	private Object resolveInstanceStringField(InsnNode igetInsn) {
+		if (!(igetInsn instanceof IndexInsnNode)) {
+			return null;
+		}
+		Object idx = ((IndexInsnNode) igetInsn).getIndex();
+		if (!(idx instanceof jadx.core.dex.info.FieldInfo)) {
+			return null;
+		}
+		jadx.core.dex.info.FieldInfo f = (jadx.core.dex.info.FieldInfo) idx;
+		String id = f.getRawFullId();
+		return keys.isImmutable(id) ? keys.instanceStrings().get(id) : null;
 	}
 
 	/**
@@ -445,6 +462,15 @@ final class ObjectEvaluator {
 		if (!jdk.handles(declClass)) {
 			return null;
 		}
+		if (isMutableStringBuilderObserver(declClass, name) && hasExternalReceiverUse(inv)) {
+			// StringBuilder/StringBuffer are mutable. A common jadx shape is:
+			//   sb = new StringBuilder(); sb.append(...); ...; sb.toString()
+			// Evaluating only the toString() receiver's assign instruction recreates a fresh empty builder
+			// and misses those earlier mutating statements, causing false folds to "". First try a conservative
+			// replay of owned, earlier builder mutators; if any runtime value participates, refuse.
+			Object replayed = replayMutableStringBuilderObserver(inv, declClass, name, depth);
+			return replayed != null ? replayed : null;
+		}
 		int firstArg;
 		Object instance;
 		if (ctor || isStatic) {
@@ -488,6 +514,123 @@ final class ObjectEvaluator {
 			}
 		}
 		return result;
+	}
+
+	@Nullable
+	private Object replayMutableStringBuilderObserver(BaseInvokeNode observer, String declClass, String methodName, int depth) {
+		if (!"toString".equals(methodName)) {
+			return null;
+		}
+		InsnArg receiver = observer.getInstanceArg();
+		if (!(receiver instanceof RegisterArg)) {
+			return null;
+		}
+		RegisterArg builderReg = (RegisterArg) receiver;
+		SSAVar sVar = builderReg.getSVar();
+		if (sVar == null) {
+			return null;
+		}
+		Object instance = evalObject(receiver, depth + 1);
+		if (!(instance instanceof StringBuilder) && !(instance instanceof StringBuffer)) {
+			return null;
+		}
+		int observerOrder = insnIndex.orderOf(observer);
+		java.util.List<InsnNode> mutators = new java.util.ArrayList<>();
+		for (RegisterArg use : sVar.getUseList()) {
+			InsnNode parent = use.getParentInsn();
+			if (parent == null || parent == observer) {
+				continue;
+			}
+			int order = insnIndex.orderOf(parent);
+			if (order >= observerOrder) {
+				continue; // later use cannot affect this observation
+			}
+			if (!isBuilderMutatorUse(parent, use, declClass)) {
+				return null;
+			}
+			mutators.add(parent);
+		}
+		mutators.sort(java.util.Comparator.comparingInt(insnIndex::orderOf));
+		for (InsnNode mutator : mutators) {
+			BaseInvokeNode call = (BaseInvokeNode) mutator;
+			Object[] args = collectArgs(call, 1, depth + 1);
+			if (args == null) {
+				return null;
+			}
+			Object result = jdk.invoke(call.getCallMth(), instance, args);
+			if (result == null) {
+				return null;
+			}
+		}
+		return instance.toString();
+	}
+
+	private static boolean isBuilderMutatorUse(InsnNode insn, RegisterArg receiverUse, String declClass) {
+		if (!(insn instanceof BaseInvokeNode) || receiverUse != insn.getArg(0)) {
+			return false;
+		}
+		BaseInvokeNode inv = (BaseInvokeNode) insn;
+		if (!declClass.equals(inv.getCallMth().getDeclClass().getFullName())) {
+			return false;
+		}
+		switch (inv.getCallMth().getName()) {
+			case "append":
+			case "appendCodePoint":
+			case "reverse":
+			case "insert":
+			case "delete":
+			case "deleteCharAt":
+			case "replace":
+			case "setCharAt":
+			case "setLength":
+			case "trimToSize":
+				return true;
+			default:
+				return false;
+		}
+	}
+
+	private static boolean isMutableStringBuilderObserver(String declClass, String methodName) {
+		if (!"java.lang.StringBuilder".equals(declClass) && !"java.lang.StringBuffer".equals(declClass)) {
+			return false;
+		}
+		switch (methodName) {
+			case "toString":
+			case "length":
+			case "capacity":
+			case "charAt":
+			case "codePointAt":
+			case "indexOf":
+			case "lastIndexOf":
+			case "substring":
+			case "subSequence":
+			case "getChars":
+			case "compareTo":
+			case "equals":
+			case "hashCode":
+			case "chars":
+			case "codePoints":
+				return true;
+			default:
+				return false;
+		}
+	}
+
+	private static boolean hasExternalReceiverUse(BaseInvokeNode inv) {
+		InsnArg receiver = inv.getInstanceArg();
+		if (!(receiver instanceof RegisterArg)) {
+			return false;
+		}
+		SSAVar sVar = ((RegisterArg) receiver).getSVar();
+		if (sVar == null) {
+			return false;
+		}
+		for (RegisterArg use : sVar.getUseList()) {
+			if (use.getParentInsn() != inv) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	/** Symbolic ref to a class jadx loaded from the app (not host-loadable for reflection). */
@@ -617,16 +760,12 @@ final class ObjectEvaluator {
 			if (arrReg == null || arrReg.getSVar() == null) {
 				return out;
 			}
-			for (BlockNode block : mth.getBasicBlocks()) {
-				for (InsnNode insn : block.getInstructions()) {
-					if (insn.getType() == InsnType.APUT && insn.getArg(0).isSameVar(arrReg)) {
-						Long idx = intEval.evalInt(insn.getArg(1), 0);
-						if (idx == null || idx < 0 || idx >= out.length) {
-							return null;
-						}
-						out[idx.intValue()] = allowNull(evalObject(insn.getArg(2), depth + 1));
-					}
+			for (InsnNode insn : insnIndex.aputsFor(arrReg)) {
+				Long idx = intEval.evalInt(insn.getArg(1), 0);
+				if (idx == null || idx < 0 || idx >= out.length) {
+					return null;
 				}
+				out[idx.intValue()] = allowNull(evalObject(insn.getArg(2), depth + 1));
 			}
 			return out;
 		}

@@ -75,10 +75,14 @@ final class PipelineRegistry {
 		if (!hasExact && !hasPredicates) {
 			return null;
 		}
-		List<PipelineRegistration> out = new ArrayList<>((hasExact ? exactList.size() : 0) + predicates.size());
-		if (hasExact) {
-			out.addAll(exactList);
+		if (hasExact && !hasPredicates) {
+			return exactList;
 		}
+		if (!hasExact) {
+			return predicates;
+		}
+		List<PipelineRegistration> out = new ArrayList<>(exactList.size() + predicates.size());
+		out.addAll(exactList);
 		out.addAll(predicates);
 		return out;
 	}
